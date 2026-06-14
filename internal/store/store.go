@@ -1,0 +1,1826 @@
+package store
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	htmlpkg "html"
+	"io"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
+	"net/mail"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	cryptobox "lehnert.dev/murat/internal/crypto"
+)
+
+type Store struct {
+	paths       Paths
+	box         *cryptobox.Box
+	mu          sync.RWMutex
+	index       Index
+	search      map[string][]string
+	dirty       bool
+	searchDirty bool
+	flushing    bool
+}
+
+type Index struct {
+	Version        int                     `json:"version"`
+	Mailboxes      map[string]any          `json:"mailboxes,omitempty"`
+	Messages       map[string]*Message     `json:"messages"`
+	Bodies         map[string]any          `json:"bodies,omitempty"`
+	Drafts         []any                   `json:"drafts,omitempty"`
+	SyncState      map[string]any          `json:"sync_state,omitempty"`
+	KnownAddresses map[string]KnownAddress `json:"known_addresses,omitempty"`
+	UpdatedAt      string                  `json:"updated_at,omitempty"`
+}
+
+type SearchIndex struct {
+	Version int                 `json:"version"`
+	Search  map[string][]string `json:"search_index"`
+}
+
+type Message struct {
+	store         *Store `json:"-"`
+	extra         map[string]json.RawMessage
+	Key           string   `json:"key"`
+	AccountID     string   `json:"account_id,omitempty"`
+	From          string   `json:"from,omitempty"`
+	To            []string `json:"to,omitempty"`
+	Cc            []string `json:"cc,omitempty"`
+	Subject       string   `json:"subject,omitempty"`
+	ReceivedAt    string   `json:"received_at,omitempty"`
+	SentAt        string   `json:"sent_at,omitempty"`
+	Read          bool     `json:"read,omitempty"`
+	Spam          bool     `json:"spam,omitempty"`
+	Trashed       bool     `json:"trashed,omitempty"`
+	Tags          []string `json:"tags,omitempty"`
+	RemoteID      string   `json:"remote_id,omitempty"`
+	HasAttachment bool     `json:"has_attachment,omitempty"`
+	RawRel        string   `json:"eml_rel,omitempty"`
+	BodyRel       string   `json:"body_rel,omitempty"`
+	RawSize       int      `json:"raw_size,omitempty"`
+}
+
+func (m *Message) UnmarshalJSON(data []byte) error {
+	type alias Message
+	var value alias
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for _, key := range []string{"key", "account_id", "from", "to", "cc", "subject", "received_at", "sent_at", "read", "spam", "trashed", "tags", "remote_id", "has_attachment", "eml_rel", "body_rel", "raw_size"} {
+		delete(raw, key)
+	}
+	if value.RawRel == "" {
+		var legacy struct {
+			RawRel string `json:"raw_rel"`
+		}
+		_ = json.Unmarshal(data, &legacy)
+		value.RawRel = legacy.RawRel
+		delete(raw, "raw_rel")
+	}
+	*m = Message(value)
+	m.extra = raw
+	return nil
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	type alias Message
+	value := alias(m)
+	value.store = nil
+	value.extra = nil
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	for key, value := range m.extra {
+		if _, exists := raw[key]; !exists {
+			raw[key] = value
+		}
+	}
+	return json.Marshal(raw)
+}
+
+type Body struct {
+	Headers   string `json:"headers"`
+	Text      string `json:"text"`
+	RawSize   int    `json:"raw_size"`
+	FetchedAt string `json:"fetched_at"`
+}
+
+type Attachment struct {
+	Filename    string
+	ContentType string
+	Size        int
+	Data        []byte
+}
+
+type KnownAddress struct {
+	Name   string `json:"name,omitempty"`
+	Email  string `json:"email"`
+	SeenAt string `json:"seen_at,omitempty"`
+	Count  int    `json:"count,omitempty"`
+}
+
+func (a KnownAddress) String() string {
+	name := strings.TrimSpace(a.Name)
+	if name != "" {
+		if !strings.ContainsAny(name, `()<>[]:;@\,."`) {
+			return name + " <" + a.Email + ">"
+		}
+		return (&mail.Address{Name: name, Address: a.Email}).String()
+	}
+	return a.Email
+}
+
+type mailboxInfo struct {
+	ID       string
+	Name     string
+	Role     string
+	ParentID string
+}
+
+func Open(paths Paths, key []byte) (*Store, error) {
+	if err := paths.EnsureDirs(); err != nil {
+		return nil, err
+	}
+	box, err := cryptobox.NewBox(key)
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{paths: paths, box: box, index: emptyIndex(), search: map[string][]string{}}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	if err := s.loadSearch(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) Paths() Paths { return s.paths }
+
+func (s *Store) load() error {
+	data, err := os.ReadFile(s.paths.IndexFile)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	plain, err := s.box.Open(data)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(plain, &s.index); err != nil {
+		return err
+	}
+	s.normalize()
+	return nil
+}
+
+func (s *Store) loadSearch() error {
+	data, err := os.ReadFile(s.paths.SearchFile)
+	if os.IsNotExist(err) {
+		s.search = s.buildSearchIndexLocked()
+		s.searchDirty = true
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	plain, err := s.box.Open(data)
+	if err != nil {
+		return err
+	}
+	var index SearchIndex
+	if err := json.Unmarshal(plain, &index); err != nil {
+		return err
+	}
+	s.search = normalizeSearchIndex(index.Search)
+	s.updateDraftSearchLocked()
+	return nil
+}
+
+func emptyIndex() Index {
+	return Index{Version: 1, Mailboxes: map[string]any{}, Messages: map[string]*Message{}, Bodies: map[string]any{}, Drafts: []any{}, SyncState: map[string]any{}, KnownAddresses: map[string]KnownAddress{}}
+}
+
+func (s *Store) normalize() {
+	if s.index.Version == 0 {
+		s.index.Version = 1
+	}
+	if s.index.Mailboxes == nil {
+		s.index.Mailboxes = map[string]any{}
+	}
+	if s.index.Messages == nil {
+		s.index.Messages = map[string]*Message{}
+	}
+	if s.index.Bodies == nil {
+		s.index.Bodies = map[string]any{}
+	}
+	if s.index.Drafts == nil {
+		s.index.Drafts = []any{}
+	}
+	if s.index.SyncState == nil {
+		s.index.SyncState = map[string]any{}
+	}
+	if s.index.KnownAddresses == nil {
+		s.index.KnownAddresses = map[string]KnownAddress{}
+	}
+	for _, msg := range s.index.Messages {
+		msg.store = s
+	}
+	if len(s.index.KnownAddresses) == 0 {
+		for _, msg := range s.index.Messages {
+			s.rememberMessageAddressesLocked(msg, messageTime(msg))
+		}
+	}
+}
+
+func (s *Store) Save() error {
+	s.mu.Lock()
+	s.normalize()
+	s.index.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	s.mu.Unlock()
+	s.mu.RLock()
+	data, err := json.Marshal(s.index)
+	s.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	sealed, err := s.box.Seal(data)
+	if err != nil {
+		return err
+	}
+	if err := atomicWrite(s.paths.IndexFile, sealed, 0o600); err != nil {
+		return err
+	}
+	return s.saveSearchIfDirty()
+}
+
+func (s *Store) saveSearchIfDirty() error {
+	s.mu.RLock()
+	dirty := s.searchDirty
+	search := cloneSearchIndex(s.search)
+	s.mu.RUnlock()
+	if !dirty {
+		return nil
+	}
+	plain, err := json.Marshal(SearchIndex{Version: 1, Search: search})
+	if err != nil {
+		return err
+	}
+	sealed, err := s.box.Seal(plain)
+	if err != nil {
+		return err
+	}
+	if err := atomicWrite(s.paths.SearchFile, sealed, 0o600); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.searchDirty = false
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Store) MarkDirty() {
+	s.mu.Lock()
+	s.dirty = true
+	start := !s.flushing
+	if start {
+		s.flushing = true
+	}
+	s.mu.Unlock()
+	if start {
+		go s.flushLoop()
+	}
+}
+
+func (s *Store) flushLoop() {
+	time.Sleep(200 * time.Millisecond)
+	for {
+		s.mu.Lock()
+		if !s.dirty {
+			s.flushing = false
+			s.mu.Unlock()
+			return
+		}
+		s.dirty = false
+		s.mu.Unlock()
+		_ = s.Save()
+	}
+}
+
+func (s *Store) Flush() error { return s.Save() }
+
+func (s *Store) Messages(includeSpam bool) []*Message {
+	return s.MessagesAll(includeSpam, false)
+}
+
+func (s *Store) MessagesAll(includeSpam, includeSent bool) []*Message {
+	s.mu.RLock()
+	out := make([]*Message, 0, len(s.index.Messages))
+	for _, msg := range s.index.Messages {
+		if msg.Trashed || (!includeSpam && msg.Spam) || (!includeSent && msg.IsSent()) || msg.RawRel == "" {
+			continue
+		}
+		out = append(out, msg)
+	}
+	s.mu.RUnlock()
+	sortMessages(out)
+	return out
+}
+
+func (s *Store) Drafts() []*Message {
+	s.mu.RLock()
+	out := make([]*Message, 0, len(s.index.Drafts))
+	for i, draft := range s.index.Drafts {
+		msg := messageFromDraft(i, draft)
+		if msg != nil {
+			msg.store = s
+			out = append(out, msg)
+		}
+	}
+	s.mu.RUnlock()
+	sortMessages(out)
+	return out
+}
+
+func (s *Store) Search(query string, includeSpam, includeSent, includeDrafts bool) []*Message {
+	tokens := tokenize(query)
+	if len(tokens) == 0 {
+		return nil
+	}
+	s.mu.RLock()
+	var keys map[string]bool
+	for _, token := range tokens {
+		posting := s.search[token]
+		if len(posting) == 0 {
+			s.mu.RUnlock()
+			return nil
+		}
+		current := map[string]bool{}
+		for _, key := range posting {
+			current[key] = true
+		}
+		if keys == nil {
+			keys = current
+			continue
+		}
+		for key := range keys {
+			if !current[key] {
+				delete(keys, key)
+			}
+		}
+	}
+	out := []*Message{}
+	for key := range keys {
+		if strings.HasPrefix(key, "draft:") {
+			if includeDrafts {
+				if msg := s.draftByKeyLocked(key); msg != nil {
+					msg.store = s
+					out = append(out, msg)
+				}
+			}
+			continue
+		}
+		msg := s.index.Messages[key]
+		if msg == nil || msg.Trashed || (!includeSpam && msg.Spam) || (!includeSent && msg.IsSent()) || msg.RawRel == "" {
+			continue
+		}
+		out = append(out, msg)
+	}
+	s.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		left := messageTime(out[i])
+		right := messageTime(out[j])
+		if left != right {
+			return left > right
+		}
+		if out[i].AccountID != out[j].AccountID {
+			return out[i].AccountID < out[j].AccountID
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out
+}
+
+func sortMessages(out []*Message) {
+	sort.Slice(out, func(i, j int) bool {
+		left := messageTime(out[i])
+		right := messageTime(out[j])
+		if left != right {
+			return left > right
+		}
+		if out[i].AccountID != out[j].AccountID {
+			return out[i].AccountID < out[j].AccountID
+		}
+		return out[i].Key < out[j].Key
+	})
+}
+
+func (s *Store) Message(key string) (*Message, bool) {
+	s.mu.RLock()
+	msg, ok := s.index.Messages[key]
+	s.mu.RUnlock()
+	return msg, ok
+}
+
+func (s *Store) KnownRemoteIDs(accountID string) map[string]bool {
+	out := map[string]bool{}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, msg := range s.index.Messages {
+		if msg == nil || msg.RemoteID == "" {
+			continue
+		}
+		if accountID == "" || msg.AccountID == accountID {
+			out[msg.RemoteID] = true
+		}
+	}
+	return out
+}
+
+func (s *Store) KnownAddresses() []KnownAddress {
+	s.mu.RLock()
+	out := make([]KnownAddress, 0, len(s.index.KnownAddresses))
+	for _, addr := range s.index.KnownAddresses {
+		out = append(out, addr)
+	}
+	s.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return strings.ToLower(out[i].String()) < strings.ToLower(out[j].String())
+	})
+	return out
+}
+
+func (s *Store) RememberAddressStrings(values ...string) {
+	s.mu.Lock()
+	for _, value := range values {
+		s.rememberAddressListLocked(value, time.Now().UTC().Format(time.RFC3339))
+	}
+	s.mu.Unlock()
+	s.MarkDirty()
+}
+
+func (s *Store) RemoveMessage(key string, removeEML bool) error {
+	s.mu.Lock()
+	msg := s.index.Messages[key]
+	if msg == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("message not found")
+	}
+	delete(s.index.Messages, key)
+	delete(s.index.Bodies, key)
+	removeSearchKey(s.search, key)
+	s.searchDirty = true
+	s.mu.Unlock()
+	if removeEML && msg.RawRel != "" {
+		_ = os.Remove(filepath.Join(s.paths.RawDir, msg.RawRel))
+	}
+	s.MarkDirty()
+	return nil
+}
+
+func (s *Store) SetMailboxes(accountID string, boxes []map[string]any) {
+	items := make([]any, 0, len(boxes))
+	for _, box := range boxes {
+		items = append(items, box)
+	}
+	s.mu.Lock()
+	s.index.Mailboxes[accountID] = items
+	s.mu.Unlock()
+	s.MarkDirty()
+}
+
+func (s *Store) ImportRaw(raw []byte) (*Message, error) {
+	parsed, bodyText, hasAttachment, err := parseRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(raw)
+	key := hex.EncodeToString(sum[:])
+	rel := emlRelForKey(key)
+	msg := messageFromMail(key, parsed, raw, rel, hasAttachment)
+	if err := s.writeEncrypted(filepath.Join(s.paths.RawDir, rel), raw); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if existing := s.index.Messages[key]; existing != nil {
+		if len(msg.Tags) == 0 {
+			msg.Tags = append([]string(nil), existing.Tags...)
+		}
+		if msg.AccountID == "" {
+			msg.AccountID = existing.AccountID
+		}
+		msg.Read = existing.Read
+		msg.Spam = existing.Spam
+		msg.Trashed = existing.Trashed
+	}
+	msg.store = s
+	s.index.Messages[key] = msg
+	s.rememberHeaderAddressesLocked(parsed.Header, msg.ReceivedAt)
+	s.updateSearchForKeyLocked(key, searchDocument(msg, bodyText))
+	s.mu.Unlock()
+	s.MarkDirty()
+	return msg, nil
+}
+
+func (s *Store) OpenBody(msg *Message) (*Body, error) {
+	if msg != nil && msg.IsDraft() {
+		body := s.DraftBody(msg)
+		if body == nil {
+			return nil, fmt.Errorf("draft not found")
+		}
+		return body, nil
+	}
+	if msg.RawRel == "" {
+		return nil, fmt.Errorf("message has no raw EML")
+	}
+	raw, err := s.readEncrypted(filepath.Join(s.paths.RawDir, msg.RawRel))
+	if err != nil {
+		return nil, err
+	}
+	_, text, hasAttachment, err := parseRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	msg.HasAttachment = hasAttachment
+	body := Body{Headers: headerText(raw), Text: text, RawSize: len(raw), FetchedAt: time.Now().UTC().Format(time.RFC3339)}
+	return &body, nil
+}
+
+func (s *Store) Attachments(msg *Message) ([]Attachment, error) {
+	if msg.RawRel == "" {
+		return nil, fmt.Errorf("message has no raw EML")
+	}
+	raw, err := s.readEncrypted(filepath.Join(s.paths.RawDir, msg.RawRel))
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	attachments := []Attachment{}
+	if err := extractAttachments(parsed.Header, parsed.Body, &attachments); err != nil {
+		return nil, err
+	}
+	return attachments, nil
+}
+
+func (s *Store) SaveAttachments(msg *Message, dir string) ([]string, error) {
+	attachments, err := s.Attachments(msg)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(attachments))
+	for i, attachment := range attachments {
+		name := attachment.Filename
+		if strings.TrimSpace(name) == "" {
+			name = fmt.Sprintf("attachment-%d", i+1)
+		}
+		path := uniquePath(filepath.Join(dir, safeAttachmentName(name)))
+		if err := os.WriteFile(path, attachment.Data, 0o600); err != nil {
+			return paths, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func (s *Store) readBodyRel(rel string) (*Body, error) {
+	data, err := s.readEncrypted(filepath.Join(s.paths.BodyDir, rel))
+	if err != nil {
+		return nil, err
+	}
+	var body Body
+	if err := json.Unmarshal(data, &body); err != nil {
+		return nil, err
+	}
+	return &body, nil
+}
+
+func (m *Message) SetRead(read bool) {
+	if m.store == nil {
+		m.Read = read
+		return
+	}
+	m.store.mu.Lock()
+	m.Read = read
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func (m *Message) SetRemote(accountID, remoteID string) {
+	if m.store == nil {
+		m.AccountID = accountID
+		m.RemoteID = remoteID
+		return
+	}
+	m.store.mu.Lock()
+	m.AccountID = accountID
+	m.RemoteID = remoteID
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func (m *Message) MarkTrashed() {
+	if m.store == nil {
+		m.Trashed = true
+		m.addTag("trash")
+		return
+	}
+	m.store.mu.Lock()
+	m.Trashed = true
+	m.addTag("trash")
+	m.store.updateSearchForMessageLocked(m)
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func (m *Message) SetSpam(spam bool) {
+	if m.store == nil {
+		m.Spam = spam
+		if spam {
+			m.addTag("spam")
+		} else {
+			m.removeTag("spam")
+		}
+		return
+	}
+	m.store.mu.Lock()
+	m.Spam = spam
+	if spam {
+		m.addTag("spam")
+	} else {
+		m.removeTag("spam")
+	}
+	m.store.updateSearchForMessageLocked(m)
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func (m *Message) SetTags(tags []string) {
+	clean := cleanTags(tags)
+	if m.store == nil {
+		m.Tags = clean
+		return
+	}
+	m.store.mu.Lock()
+	m.Tags = clean
+	m.store.updateSearchForMessageLocked(m)
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func cleanTags(tags []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag != "" && !seen[tag] {
+			seen[tag] = true
+			out = append(out, tag)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (m *Message) DisplayTags() []string {
+	if len(m.Tags) > 0 {
+		return m.resolveTagNames(m.Tags)
+	}
+	if tags := m.folderTags(); len(tags) > 0 {
+		return m.resolveTagNames(tags)
+	}
+	if m.IsDraft() {
+		return []string{"draft"}
+	}
+	if m.IsSent() {
+		return []string{"sent"}
+	}
+	return []string{"INBOX"}
+}
+
+func (m *Message) FolderColumn() string {
+	if m == nil {
+		return ""
+	}
+	if m.IsDraft() {
+		return "d"
+	}
+	candidates := m.folderTags()
+	if len(candidates) == 0 {
+		candidates = m.Tags
+	}
+	if len(candidates) == 0 && m.Spam {
+		return "j"
+	}
+	resolved := m.resolveMailboxInfos(candidates)
+	for _, box := range resolved {
+		switch normalizedMailboxRole(box.Role) {
+		case "inbox":
+			return "i"
+		case "sent":
+			return "o"
+		case "junk", "spam":
+			return "j"
+		case "drafts", "draft":
+			return "d"
+		}
+	}
+	for _, box := range resolved {
+		if marker := folderMarkerFromName(box.Name); marker != "" {
+			return marker
+		}
+	}
+	for _, box := range resolved {
+		if name := folderBaseName(box.Name); name != "" {
+			return name
+		}
+	}
+	if m.Spam {
+		return "j"
+	}
+	if m.IsSent() {
+		return "o"
+	}
+	return "i"
+}
+
+func (m *Message) addTag(tag string) {
+	for _, current := range m.Tags {
+		if current == tag {
+			return
+		}
+	}
+	m.Tags = append(m.Tags, tag)
+	sort.Strings(m.Tags)
+}
+
+func (m *Message) removeTag(tag string) {
+	kept := m.Tags[:0]
+	for _, current := range m.Tags {
+		if current != tag {
+			kept = append(kept, current)
+		}
+	}
+	m.Tags = kept
+}
+
+func (m *Message) IsSent() bool {
+	return hasSentTag(m.Tags) || hasSentTag(m.folderTags())
+}
+
+func hasSentTag(tags []string) bool {
+	for _, tag := range tags {
+		for _, part := range strings.Split(tag, "/") {
+			name := strings.TrimSpace(strings.ToLower(part))
+			if name == "sent" || name == "sent mail" || name == "sent messages" || name == "sent items" || name == "sent-mail" || name == "sentmail" || name == "outbox" || name == "gesendet" || name == "gesendete elemente" || name == "gesendete objekte" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *Message) folderTags() []string {
+	if m.extra == nil {
+		return nil
+	}
+	var mailbox string
+	if raw := m.extra["imap_mailbox"]; len(raw) > 0 && json.Unmarshal(raw, &mailbox) == nil && mailbox != "" {
+		return []string{mailbox}
+	}
+	var mailboxes []string
+	if raw := m.extra["mailbox_ids"]; len(raw) > 0 && json.Unmarshal(raw, &mailboxes) == nil && len(mailboxes) > 0 {
+		return mailboxes
+	}
+	return nil
+}
+
+func (m *Message) resolveTagNames(values []string) []string {
+	infos := m.resolveMailboxInfos(values)
+	out := []string{}
+	for _, info := range infos {
+		if name := folderBaseName(info.Name); name != "" {
+			out = append(out, name)
+		}
+	}
+	return cleanTags(out)
+}
+
+func (m *Message) resolveMailboxInfos(values []string) []mailboxInfo {
+	out := []mailboxInfo{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if m.store != nil {
+			if info, ok := m.store.mailboxInfo(m.AccountID, value); ok {
+				out = append(out, info)
+				continue
+			}
+		}
+		out = append(out, mailboxInfo{ID: value, Name: value})
+	}
+	return out
+}
+
+func (s *Store) mailboxInfo(accountID, mailboxID string) (mailboxInfo, bool) {
+	if s == nil || mailboxID == "" {
+		return mailboxInfo{}, false
+	}
+	boxes := s.mailboxInfos(accountID)
+	byID := map[string]mailboxInfo{}
+	for _, box := range boxes {
+		byID[box.ID] = box
+	}
+	box, ok := byID[mailboxID]
+	if !ok {
+		return mailboxInfo{}, false
+	}
+	box.Name = s.mailboxPath(box.ID, byID, map[string]bool{})
+	return box, true
+}
+
+func (s *Store) mailboxInfos(accountID string) []mailboxInfo {
+	value := s.index.Mailboxes[accountID]
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := []mailboxInfo{}
+	for _, item := range items {
+		box, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := stringAny(box["id"])
+		if id == "" {
+			continue
+		}
+		out = append(out, mailboxInfo{ID: id, Name: firstNonEmptyString(stringAny(box["name"]), id), Role: stringAny(box["role"]), ParentID: stringAny(box["parentId"])})
+	}
+	return out
+}
+
+func (s *Store) mailboxPath(id string, byID map[string]mailboxInfo, seen map[string]bool) string {
+	if seen[id] {
+		return id
+	}
+	seen[id] = true
+	box, ok := byID[id]
+	if !ok {
+		return id
+	}
+	name := firstNonEmptyString(box.Name, id)
+	if box.ParentID != "" {
+		if _, ok := byID[box.ParentID]; ok {
+			return s.mailboxPath(box.ParentID, byID, seen) + "/" + name
+		}
+	}
+	return name
+}
+
+func normalizedMailboxRole(role string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "junk" || role == "spam" {
+		return role
+	}
+	return role
+}
+
+func folderMarkerFromName(name string) string {
+	base := strings.ToLower(folderBaseName(name))
+	switch base {
+	case "inbox", "posteingang":
+		return "i"
+	case "sent", "sent mail", "sent messages", "sent items", "sent-mail", "sentmail", "outbox", "gesendet", "gesendete elemente", "gesendete objekte":
+		return "o"
+	case "spam", "junk", "junk e-mail", "junk mail", "bulk mail":
+		return "j"
+	case "drafts", "draft", "entwürfe", "entwuerfe":
+		return "d"
+	default:
+		return ""
+	}
+}
+
+func folderBaseName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	name = strings.ReplaceAll(name, "\\", "/")
+	parts := strings.Split(name, "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		if part := strings.TrimSpace(parts[i]); part != "" {
+			return part
+		}
+	}
+	return name
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (m *Message) IsDraft() bool { return strings.HasPrefix(m.Key, "draft:") }
+
+func (s *Store) SaveDraft(accountID, from, to, cc, bcc, subject, body string) error {
+	record := map[string]any{
+		"created_at": time.Now().UTC().Format(time.RFC3339),
+		"account_id": accountID,
+		"from":       from,
+		"to":         to,
+		"cc":         cc,
+		"bcc":        bcc,
+		"subject":    subject,
+		"body":       body,
+	}
+	s.mu.Lock()
+	s.index.Drafts = append(s.index.Drafts, record)
+	key := fmt.Sprintf("draft:%d", len(s.index.Drafts)-1)
+	msg := messageFromDraft(len(s.index.Drafts)-1, record)
+	if msg != nil {
+		body := ""
+		if raw := msg.extra["body"]; len(raw) > 0 {
+			_ = json.Unmarshal(raw, &body)
+		}
+		s.updateSearchForKeyLocked(key, searchDocument(msg, body))
+	}
+	s.mu.Unlock()
+	s.MarkDirty()
+	return nil
+}
+
+func messageFromDraft(index int, value any) *Message {
+	draft, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	to := splitAnyStrings(draft["to"])
+	cc := splitAnyStrings(draft["cc"])
+	created := stringAny(draft["created_at"])
+	return &Message{
+		Key:        fmt.Sprintf("draft:%d", index),
+		AccountID:  stringAny(draft["account_id"]),
+		From:       firstNonEmptyString(stringAny(draft["from"]), "draft"),
+		To:         to,
+		Cc:         cc,
+		Subject:    stringAny(draft["subject"]),
+		ReceivedAt: created,
+		SentAt:     created,
+		Read:       true,
+		Tags:       []string{"draft"},
+		extra: map[string]json.RawMessage{
+			"body": rawJSON(draft["body"]),
+		},
+	}
+}
+
+func (s *Store) draftByKeyLocked(key string) *Message {
+	indexText := strings.TrimPrefix(key, "draft:")
+	index, err := strconv.Atoi(indexText)
+	if err != nil || index < 0 || index >= len(s.index.Drafts) {
+		return nil
+	}
+	return messageFromDraft(index, s.index.Drafts[index])
+}
+
+func (s *Store) DraftBody(msg *Message) *Body {
+	if msg == nil || !msg.IsDraft() {
+		return nil
+	}
+	s.mu.RLock()
+	draft := s.draftByKeyLocked(msg.Key)
+	s.mu.RUnlock()
+	if draft == nil {
+		return nil
+	}
+	body := ""
+	if raw := draft.extra["body"]; len(raw) > 0 {
+		_ = json.Unmarshal(raw, &body)
+	}
+	return &Body{Text: body, FetchedAt: time.Now().UTC().Format(time.RFC3339)}
+}
+
+func rawJSON(value any) json.RawMessage {
+	data, _ := json.Marshal(value)
+	return data
+}
+
+func stringAny(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return ""
+}
+
+func splitAnyStrings(value any) []string {
+	switch typed := value.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil
+		}
+		return []string{typed}
+	case []any:
+		out := []string{}
+		for _, item := range typed {
+			if text := stringAny(item); text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+var tokenRE = regexp.MustCompile(`[a-z0-9][a-z0-9_.+-]{1,}`)
+
+func tokenize(text string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, token := range tokenRE.FindAllString(strings.ToLower(text), -1) {
+		if !seen[token] {
+			seen[token] = true
+			out = append(out, token)
+		}
+	}
+	return out
+}
+
+func (s *Store) buildSearchIndexLocked() map[string][]string {
+	index := map[string][]string{}
+	for key, msg := range s.index.Messages {
+		if msg == nil {
+			continue
+		}
+		addSearchDoc(index, key, s.searchDocumentForMessageLocked(msg))
+	}
+	for i, draft := range s.index.Drafts {
+		msg := messageFromDraft(i, draft)
+		if msg == nil {
+			continue
+		}
+		body := ""
+		if raw := msg.extra["body"]; len(raw) > 0 {
+			_ = json.Unmarshal(raw, &body)
+		}
+		addSearchDoc(index, msg.Key, searchDocument(msg, body))
+	}
+	return normalizeSearchIndex(index)
+}
+
+func (s *Store) updateDraftSearchLocked() {
+	for token, keys := range s.search {
+		kept := keys[:0]
+		for _, key := range keys {
+			if !strings.HasPrefix(key, "draft:") {
+				kept = append(kept, key)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.search, token)
+		} else {
+			s.search[token] = kept
+		}
+	}
+	for i, draft := range s.index.Drafts {
+		msg := messageFromDraft(i, draft)
+		if msg == nil {
+			continue
+		}
+		body := ""
+		if raw := msg.extra["body"]; len(raw) > 0 {
+			_ = json.Unmarshal(raw, &body)
+		}
+		addSearchDoc(s.search, msg.Key, searchDocument(msg, body))
+	}
+	s.search = normalizeSearchIndex(s.search)
+	s.searchDirty = true
+}
+
+func (s *Store) updateSearchForMessageLocked(msg *Message) {
+	if msg == nil {
+		return
+	}
+	s.updateSearchForKeyLocked(msg.Key, s.searchDocumentForMessageLocked(msg))
+}
+
+func (s *Store) updateSearchForKeyLocked(key, doc string) {
+	removeSearchKey(s.search, key)
+	addSearchDoc(s.search, key, doc)
+	s.search = normalizeSearchIndex(s.search)
+	s.searchDirty = true
+}
+
+func (s *Store) searchDocumentForMessageLocked(msg *Message) string {
+	body := ""
+	if value, ok := s.index.Bodies[msg.Key].(map[string]any); ok {
+		body = stringAny(value["body"])
+	}
+	return searchDocument(msg, body)
+}
+
+func searchDocument(msg *Message, body string) string {
+	return strings.Join([]string{
+		msg.Subject,
+		msg.From,
+		strings.Join(msg.To, " "),
+		strings.Join(msg.Cc, " "),
+		strings.Join(msg.Tags, " "),
+		body,
+	}, "\n")
+}
+
+func addSearchDoc(index map[string][]string, key, doc string) {
+	for _, token := range tokenize(doc) {
+		index[token] = append(index[token], key)
+	}
+}
+
+func removeSearchKey(index map[string][]string, key string) {
+	for token, keys := range index {
+		kept := keys[:0]
+		for _, current := range keys {
+			if current != key {
+				kept = append(kept, current)
+			}
+		}
+		if len(kept) == 0 {
+			delete(index, token)
+		} else {
+			index[token] = kept
+		}
+	}
+}
+
+func normalizeSearchIndex(value map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for token, keys := range value {
+		if token == "" {
+			continue
+		}
+		seen := map[string]bool{}
+		clean := []string{}
+		for _, key := range keys {
+			if key != "" && !seen[key] {
+				seen[key] = true
+				clean = append(clean, key)
+			}
+		}
+		if len(clean) > 0 {
+			sort.Strings(clean)
+			out[token] = clean
+		}
+	}
+	return out
+}
+
+func cloneSearchIndex(value map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for token, keys := range value {
+		out[token] = append([]string(nil), keys...)
+	}
+	return out
+}
+
+func (s *Store) writeEncrypted(path string, data []byte) error {
+	sealed, err := s.box.Seal(data)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, sealed, 0o600)
+}
+
+func (s *Store) readEncrypted(path string) ([]byte, error) {
+	sealed, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return s.box.Open(sealed)
+}
+
+func parseRaw(raw []byte) (*mail.Message, string, bool, error) {
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return nil, "", false, err
+	}
+	body, hasAttachment, err := extractMailText(msg.Header, msg.Body)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return msg, strings.TrimSpace(body), hasAttachment, nil
+}
+
+func messageFromMail(key string, parsed *mail.Message, raw []byte, rel string, hasAttachment bool) *Message {
+	date := parsed.Header.Get("Date")
+	if parsedDate, err := mail.ParseDate(date); err == nil {
+		date = parsedDate.UTC().Format(time.RFC3339)
+	}
+	tags := []string{}
+	if rawTags := parsed.Header.Get("X-Murat-Tags"); rawTags != "" {
+		for _, tag := range strings.Split(rawTags, ",") {
+			if strings.TrimSpace(tag) != "" {
+				tags = append(tags, strings.TrimSpace(tag))
+			}
+		}
+	}
+	return &Message{
+		Key:           key,
+		From:          parsed.Header.Get("From"),
+		To:            splitAddressHeader(parsed.Header.Get("To")),
+		Cc:            splitAddressHeader(parsed.Header.Get("Cc")),
+		Subject:       decodeHeader(parsed.Header.Get("Subject")),
+		ReceivedAt:    date,
+		RemoteID:      remoteIDFromHeader(parsed.Header),
+		Read:          false,
+		Tags:          cleanTags(tags),
+		RawRel:        rel,
+		RawSize:       len(raw),
+		HasAttachment: hasAttachment,
+	}
+}
+
+func decodeHeader(value string) string {
+	decoder := mime.WordDecoder{CharsetReader: charsetReader}
+	decoded, err := decoder.DecodeHeader(value)
+	if err != nil {
+		return value
+	}
+	return decoded
+}
+
+func charsetReader(charset string, input io.Reader) (io.Reader, error) {
+	data, err := io.ReadAll(input)
+	if err != nil {
+		return nil, err
+	}
+	return strings.NewReader(decodeBytes(data, charset)), nil
+}
+
+func remoteIDFromHeader(header mail.Header) string {
+	if value := strings.TrimSpace(header.Get("X-Murat-Remote-ID")); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(header.Get("X-Murat-JMAP-ID")); value != "" {
+		return "jmap:" + value
+	}
+	return ""
+}
+
+func (s *Store) rememberMessageAddressesLocked(msg *Message, seenAt string) {
+	if msg == nil {
+		return
+	}
+	s.rememberAddressListLocked(msg.From, seenAt)
+	for _, value := range msg.To {
+		s.rememberAddressListLocked(value, seenAt)
+	}
+	for _, value := range msg.Cc {
+		s.rememberAddressListLocked(value, seenAt)
+	}
+}
+
+func (s *Store) rememberHeaderAddressesLocked(header mail.Header, seenAt string) {
+	for _, key := range []string{"From", "Sender", "Reply-To", "To", "Cc", "Bcc"} {
+		s.rememberAddressListLocked(header.Get(key), seenAt)
+	}
+}
+
+func (s *Store) rememberAddressListLocked(value, seenAt string) {
+	for _, addr := range parseKnownAddresses(value) {
+		key := strings.ToLower(addr.Email)
+		if key == "" {
+			continue
+		}
+		current := s.index.KnownAddresses[key]
+		if current.Email == "" {
+			current.Email = addr.Email
+		}
+		if strings.TrimSpace(current.Name) == "" && strings.TrimSpace(addr.Name) != "" {
+			current.Name = addr.Name
+		}
+		if seenAt != "" {
+			current.SeenAt = seenAt
+		}
+		current.Count++
+		s.index.KnownAddresses[key] = current
+	}
+}
+
+var emailAddressRE = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+`)
+
+func parseKnownAddresses(value string) []KnownAddress {
+	value = strings.TrimSpace(decodeHeader(value))
+	if value == "" {
+		return nil
+	}
+	parser := mail.AddressParser{WordDecoder: &mime.WordDecoder{CharsetReader: charsetReader}}
+	parsed, err := parser.ParseList(value)
+	if err == nil {
+		out := make([]KnownAddress, 0, len(parsed))
+		for _, addr := range parsed {
+			if email := normalizeEmail(addr.Address); email != "" {
+				out = append(out, KnownAddress{Name: strings.TrimSpace(addr.Name), Email: email})
+			}
+		}
+		return out
+	}
+	seen := map[string]bool{}
+	out := []KnownAddress{}
+	for _, email := range emailAddressRE.FindAllString(value, -1) {
+		email = normalizeEmail(email)
+		if email != "" && !seen[email] {
+			seen[email] = true
+			out = append(out, KnownAddress{Email: email})
+		}
+	}
+	return out
+}
+
+func normalizeEmail(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if addr, err := mail.ParseAddress(value); err == nil {
+		value = addr.Address
+	}
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func emlRelForKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	hexValue := hex.EncodeToString(sum[:])
+	return filepath.Join(hexValue[:2], hexValue[2:]+".eml.enc")
+}
+
+func extractMailText(header mail.Header, body io.Reader) (string, bool, error) {
+	contentType := header.Get("Content-Type")
+	mediaType, params, _ := mime.ParseMediaType(contentType)
+	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		boundary := params["boundary"]
+		if boundary == "" {
+			return "", false, nil
+		}
+		plain, html, hasAttachment, err := extractMultipart(multipart.NewReader(body, boundary))
+		if err != nil {
+			return "", hasAttachment, err
+		}
+		if strings.TrimSpace(plain) != "" {
+			return plain, hasAttachment, nil
+		}
+		return htmlToRichText(html), hasAttachment, nil
+	}
+	data, err := readDecoded(body, header.Get("Content-Transfer-Encoding"))
+	if err != nil {
+		return "", false, err
+	}
+	text := decodeBytes(data, params["charset"])
+	if strings.HasPrefix(strings.ToLower(mediaType), "text/html") {
+		return htmlToRichText(text), false, nil
+	}
+	return text, false, nil
+}
+
+func extractMultipart(reader *multipart.Reader) (string, string, bool, error) {
+	var plain []string
+	var html []string
+	hasAttachment := false
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", "", hasAttachment, err
+		}
+		contentType := part.Header.Get("Content-Type")
+		mediaType, params, _ := mime.ParseMediaType(contentType)
+		disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+		if strings.EqualFold(disposition, "attachment") || part.FileName() != "" {
+			hasAttachment = true
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+			boundary := params["boundary"]
+			if boundary == "" {
+				continue
+			}
+			nestedPlain, nestedHTML, nestedAttachment, err := extractMultipart(multipart.NewReader(part, boundary))
+			if err != nil {
+				return "", "", hasAttachment, err
+			}
+			if nestedAttachment {
+				hasAttachment = true
+			}
+			if nestedPlain != "" {
+				plain = append(plain, nestedPlain)
+			}
+			if nestedHTML != "" {
+				html = append(html, nestedHTML)
+			}
+			continue
+		}
+		data, err := readDecoded(part, part.Header.Get("Content-Transfer-Encoding"))
+		if err != nil {
+			return "", "", hasAttachment, err
+		}
+		switch strings.ToLower(mediaType) {
+		case "text/plain":
+			plain = append(plain, decodeBytes(data, params["charset"]))
+		case "text/html":
+			html = append(html, decodeBytes(data, params["charset"]))
+		}
+	}
+	return strings.Join(plain, "\n\n"), strings.Join(html, "\n\n"), hasAttachment, nil
+}
+
+func extractAttachments(header mail.Header, body io.Reader, out *[]Attachment) error {
+	contentType := header.Get("Content-Type")
+	mediaType, params, _ := mime.ParseMediaType(contentType)
+	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		boundary := params["boundary"]
+		if boundary == "" {
+			return nil
+		}
+		reader := multipart.NewReader(body, boundary)
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			partType, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+			disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+			filename := part.FileName()
+			if strings.EqualFold(disposition, "attachment") || filename != "" {
+				data, err := readDecoded(part, part.Header.Get("Content-Transfer-Encoding"))
+				if err != nil {
+					return err
+				}
+				*out = append(*out, Attachment{Filename: filename, ContentType: partType, Size: len(data), Data: data})
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(partType), "multipart/") {
+				if err := extractAttachments(mail.Header(part.Header), part, out); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func readDecoded(reader io.Reader, encoding string) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "base64":
+		return io.ReadAll(base64.NewDecoder(base64.StdEncoding, reader))
+	case "quoted-printable":
+		return io.ReadAll(quotedprintable.NewReader(reader))
+	default:
+		return io.ReadAll(reader)
+	}
+}
+
+func decodeBytes(data []byte, charset string) string {
+	charset = strings.ToLower(strings.TrimSpace(charset))
+	switch charset {
+	case "", "utf-8", "us-ascii":
+		return string(data)
+	case "iso-8859-1", "latin1", "latin-1":
+		runes := make([]rune, len(data))
+		for i, b := range data {
+			runes[i] = rune(b)
+		}
+		return string(runes)
+	case "windows-1252", "cp1252":
+		return decodeWindows1252(data)
+	default:
+		return string(data)
+	}
+}
+
+func decodeWindows1252(data []byte) string {
+	table := map[byte]rune{
+		0x80: '€', 0x82: '‚', 0x83: 'ƒ', 0x84: '„', 0x85: '…', 0x86: '†', 0x87: '‡', 0x88: 'ˆ', 0x89: '‰', 0x8A: 'Š', 0x8B: '‹', 0x8C: 'Œ', 0x8E: 'Ž', 0x91: '‘', 0x92: '’', 0x93: '“', 0x94: '”', 0x95: '•', 0x96: '–', 0x97: '—', 0x98: '˜', 0x99: '™', 0x9A: 'š', 0x9B: '›', 0x9C: 'œ', 0x9E: 'ž', 0x9F: 'Ÿ',
+	}
+	runes := make([]rune, len(data))
+	for i, b := range data {
+		if r, ok := table[b]; ok {
+			runes[i] = r
+		} else {
+			runes[i] = rune(b)
+		}
+	}
+	return string(runes)
+}
+
+func stripHTML(value string) string {
+	value = strings.ReplaceAll(value, "\r", "")
+	value = strings.ReplaceAll(value, "<br>", "\n")
+	value = strings.ReplaceAll(value, "<br/>", "\n")
+	value = strings.ReplaceAll(value, "<br />", "\n")
+	var out strings.Builder
+	inTag := false
+	for _, r := range value {
+		switch r {
+		case '<':
+			inTag = true
+		case '>':
+			inTag = false
+		default:
+			if !inTag {
+				out.WriteRune(r)
+			}
+		}
+	}
+	return strings.TrimSpace(out.String())
+}
+
+var htmlSpaceRE = regexp.MustCompile(`[ \t\f\v]+`)
+var htmlNewlineSpaceRE = regexp.MustCompile(` *\n *`)
+var htmlManyNewlinesRE = regexp.MustCompile(`\n{3,}`)
+var htmlStyleRE = regexp.MustCompile(`(?is)\bstyle\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
+var htmlFontWeightRE = regexp.MustCompile(`font-weight\s*:\s*[6-9]00`)
+
+func htmlToRichText(value string) string {
+	text, ok := extractHTMLRichText(value)
+	if !ok {
+		return stripHTML(value)
+	}
+	return text
+}
+
+type htmlMarkers struct {
+	bold      bool
+	italic    bool
+	underline bool
+}
+
+func extractHTMLRichText(value string) (string, bool) {
+	var out strings.Builder
+	stack := []htmlMarkers{}
+	skipDepth := 0
+	for i := 0; i < len(value); {
+		if value[i] != '<' {
+			j := strings.IndexByte(value[i:], '<')
+			if j < 0 {
+				j = len(value)
+			} else {
+				j += i
+			}
+			if skipDepth == 0 {
+				out.WriteString(htmlpkg.UnescapeString(value[i:j]))
+			}
+			i = j
+			continue
+		}
+		end := strings.IndexByte(value[i:], '>')
+		if end < 0 {
+			return "", false
+		}
+		end += i
+		tagText := strings.TrimSpace(value[i+1 : end])
+		i = end + 1
+		if tagText == "" || strings.HasPrefix(tagText, "!") || strings.HasPrefix(tagText, "?") {
+			continue
+		}
+		closing := strings.HasPrefix(tagText, "/")
+		if closing {
+			tagText = strings.TrimSpace(strings.TrimPrefix(tagText, "/"))
+		}
+		selfClosing := strings.HasSuffix(tagText, "/")
+		if selfClosing {
+			tagText = strings.TrimSpace(strings.TrimSuffix(tagText, "/"))
+		}
+		tag := htmlTagName(tagText)
+		if tag == "" {
+			continue
+		}
+		if closing {
+			if (tag == "script" || tag == "style") && skipDepth > 0 {
+				skipDepth--
+				continue
+			}
+			if skipDepth > 0 {
+				continue
+			}
+			markers := htmlMarkersFor(tag, "")
+			if len(stack) > 0 {
+				markers = stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+			}
+			writeHTMLMarkerClose(&out, markers)
+			if htmlBlockTags[tag] {
+				htmlNewline(&out)
+			}
+			continue
+		}
+		if tag == "script" || tag == "style" {
+			skipDepth++
+			continue
+		}
+		if skipDepth > 0 {
+			continue
+		}
+		if tag == "br" {
+			htmlNewline(&out)
+			continue
+		}
+		if htmlBlockTags[tag] {
+			htmlNewline(&out)
+			if tag == "li" {
+				out.WriteString("- ")
+			}
+		}
+		if htmlVoidTags[tag] {
+			continue
+		}
+		markers := htmlMarkersFor(tag, htmlStyle(tagText))
+		stack = append(stack, markers)
+		writeHTMLMarkerOpen(&out, markers)
+		if selfClosing {
+			writeHTMLMarkerClose(&out, markers)
+			stack = stack[:len(stack)-1]
+		}
+	}
+	text := out.String()
+	text = strings.ReplaceAll(text, "\r", "")
+	text = htmlSpaceRE.ReplaceAllString(text, " ")
+	text = htmlNewlineSpaceRE.ReplaceAllString(text, "\n")
+	text = htmlManyNewlinesRE.ReplaceAllString(text, "\n\n")
+	return strings.TrimSpace(text), true
+}
+
+var htmlBlockTags = map[string]bool{
+	"address": true, "article": true, "aside": true, "blockquote": true, "div": true, "dl": true, "fieldset": true, "figcaption": true, "figure": true, "footer": true, "form": true, "h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true, "header": true, "hr": true, "li": true, "main": true, "nav": true, "ol": true, "p": true, "pre": true, "section": true, "table": true, "tr": true, "ul": true,
+}
+
+var htmlVoidTags = map[string]bool{
+	"area": true, "base": true, "br": true, "col": true, "embed": true, "hr": true, "img": true, "input": true, "link": true, "meta": true, "param": true, "source": true, "track": true, "wbr": true,
+}
+
+func htmlTagName(tagText string) string {
+	fields := strings.Fields(tagText)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToLower(fields[0])
+}
+
+func htmlStyle(tagText string) string {
+	match := htmlStyleRE.FindStringSubmatch(tagText)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.Trim(match[1], `"'`)
+}
+
+func htmlMarkersFor(tag, style string) htmlMarkers {
+	compactStyle := strings.ReplaceAll(strings.ToLower(style), " ", "")
+	style = strings.ToLower(style)
+	return htmlMarkers{
+		bold:      tag == "b" || tag == "strong" || strings.Contains(compactStyle, "font-weight:bold") || htmlFontWeightRE.MatchString(style),
+		italic:    tag == "i" || tag == "em" || tag == "cite" || strings.Contains(compactStyle, "font-style:italic"),
+		underline: tag == "u" || tag == "ins" || strings.Contains(compactStyle, "text-decoration:underline") || strings.Contains(compactStyle, "text-decoration-line:underline"),
+	}
+}
+
+func htmlNewline(out *strings.Builder) {
+	if out.Len() == 0 || strings.HasSuffix(out.String(), "\n") {
+		return
+	}
+	out.WriteByte('\n')
+}
+
+func writeHTMLMarkerOpen(out *strings.Builder, markers htmlMarkers) {
+	if markers.bold {
+		out.WriteString("**")
+	}
+	if markers.italic {
+		out.WriteString("*")
+	}
+	if markers.underline {
+		out.WriteString("__")
+	}
+}
+
+func writeHTMLMarkerClose(out *strings.Builder, markers htmlMarkers) {
+	if markers.underline {
+		out.WriteString("__")
+	}
+	if markers.italic {
+		out.WriteString("*")
+	}
+	if markers.bold {
+		out.WriteString("**")
+	}
+}
+
+func splitAddressHeader(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	addrs, err := mail.ParseAddressList(value)
+	if err != nil {
+		return []string{value}
+	}
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		out = append(out, addr.String())
+	}
+	return out
+}
+
+func headerText(raw []byte) string {
+	text := string(raw)
+	if idx := strings.Index(text, "\r\n\r\n"); idx >= 0 {
+		return strings.ReplaceAll(text[:idx], "\r", "")
+	}
+	if idx := strings.Index(text, "\n\n"); idx >= 0 {
+		return strings.ReplaceAll(text[:idx], "\r", "")
+	}
+	return strings.ReplaceAll(text, "\r", "")
+}
+
+func safeAttachmentName(name string) string {
+	name = filepath.Base(strings.TrimSpace(name))
+	name = strings.ReplaceAll(name, string(os.PathSeparator), "_")
+	if name == "" || name == "." || name == string(os.PathSeparator) {
+		return "attachment"
+	}
+	return name
+}
+
+func uniquePath(path string) string {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return path
+	}
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	for i := 2; ; i++ {
+		candidate := filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, i, ext))
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+}
+
+func messageTime(m *Message) string {
+	if m.ReceivedAt != "" {
+		return m.ReceivedAt
+	}
+	return m.SentAt
+}
+
+func atomicWrite(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}

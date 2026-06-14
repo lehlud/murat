@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+      - name: Test
+        run: go test ./...
+      - name: Build matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA::10}"
+          mkdir -p dist
+          targets=(
+            linux/amd64 linux/arm64 linux/arm linux/386 linux/riscv64
+            darwin/amd64 darwin/arm64
+            freebsd/amd64 freebsd/arm64 freebsd/386
+            openbsd/amd64 openbsd/arm64 openbsd/386
+            netbsd/amd64 netbsd/arm64 netbsd/386
+            dragonfly/amd64
+          )
+          for target in "${targets[@]}"; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            name="murat-${short}-${goos}-${goarch}"
+            mkdir -p "dist/${name}"
+            env CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -ldflags "-s -w -X lehnert.dev/murat/internal/app.commit=${short}" \
+              -o "dist/${name}/murat" ./cmd/murat
+            tar -C "dist/${name}" -czf "dist/${name}.tar.gz" murat
+            rm -rf "dist/${name}"
+          done
+      - name: Release by commit hash
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA::10}"
+          tag="murat-${short}"
+          gh release create "$tag" dist/*.tar.gz --title "$tag" --notes "commit ${GITHUB_SHA}"
