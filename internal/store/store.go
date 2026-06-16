@@ -219,6 +219,10 @@ func (s *Store) loadSearch() error {
 	}
 	s.search = normalizeSearchIndex(index.Search)
 	s.updateDraftSearchLocked()
+	if s.dirty {
+		s.search = s.buildSearchIndexLocked()
+		s.searchDirty = true
+	}
 	return nil
 }
 
@@ -250,6 +254,10 @@ func (s *Store) normalize() {
 	}
 	for _, msg := range s.index.Messages {
 		msg.store = s
+		if decoded := decodeHeader(msg.Subject); decoded != msg.Subject {
+			msg.Subject = decoded
+			s.dirty = true
+		}
 	}
 	if len(s.index.KnownAddresses) == 0 {
 		for _, msg := range s.index.Messages {

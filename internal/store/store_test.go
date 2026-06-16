@@ -107,6 +107,18 @@ func TestDecodeMIMEEncodedSubject(t *testing.T) {
 	}
 }
 
+func TestNormalizeDecodesStoredMIMEEncodedSubject(t *testing.T) {
+	s := &Store{index: emptyIndex()}
+	s.index.Messages["m"] = &Message{Key: "m", Subject: "=?utf-8?Q?[StudOn]_3._online-=C3=9Cbung_bis_zum_22._Juni_(22?= =?utf-8?Q?:00)?="}
+	s.normalize()
+	if got := s.index.Messages["m"].Subject; got != "[StudOn] 3. online-Übung bis zum 22. Juni (22:00)" {
+		t.Fatalf("subject = %q", got)
+	}
+	if !s.dirty {
+		t.Fatal("expected store dirty after subject migration")
+	}
+}
+
 func TestKnownRemoteIDs(t *testing.T) {
 	s := &Store{index: emptyIndex()}
 	s.index.Messages["a"] = &Message{AccountID: "acct", RemoteID: "imap:INBOX:1"}
