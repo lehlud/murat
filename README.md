@@ -4,6 +4,8 @@
 
 It syncs mail over IMAPS or JMAP, stores messages locally under your XDG data directory, and provides both a fullscreen TUI and focused CLI commands for scripting.
 
+![murat TUI showcase](showcase/Screenshot%202026-06-16%20at%2008.23.06.png)
+
 ## Features
 
 - Encrypted local mail store using the same file locations as the Python `murat` client.
