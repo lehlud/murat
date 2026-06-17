@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/base64"
 	"fmt"
@@ -31,6 +30,7 @@ const (
 	styleTag      = "\x1b[36m"
 	styleSpam     = "\x1b[1;33m"
 	styleDim      = "\x1b[2m"
+	styleLink     = "\x1b[34m"
 	styleBold     = "\x1b[1m"
 	styleItalic   = "\x1b[3m"
 	styleUnder    = "\x1b[4m"
@@ -57,6 +57,7 @@ type App struct {
 	selectStart  *point
 	selectEnd    *point
 	selectActive bool
+	selectToken  int
 	dirty        bool
 	lastW        int
 	lastH        int
@@ -73,21 +74,29 @@ type App struct {
 	error        bool
 	filter       string
 	filterQuery  string
+	pendingURL   string
 	account      int
 	actionScope  string
+	syncRunning  bool
+	syncSerial   int
+	syncTimer    *time.Timer
 	running      bool
 }
 
 type event struct {
-	status string
-	error  bool
-	reload bool
+	status           string
+	error            bool
+	reload           bool
+	clearSelectionAt int
+	autoSync         int
+	syncDone         bool
 }
 
 func Run(s *store.Store, accounts *store.AccountStore) error {
 	app := &App{store: s, accounts: accounts, events: make(chan event, 16), dirty: true, running: true}
 	app.reloadAccounts()
 	app.reload()
+	app.sync()
 	return app.run()
 }
 
@@ -108,6 +117,7 @@ func (a *App) run() error {
 	defer func() {
 		_ = cookedMode()
 		disableMouse()
+		a.stopSyncTimer()
 		fmt.Print("\x1b[?25h\x1b[?1049l")
 		_ = a.store.Flush()
 	}()
@@ -141,11 +151,29 @@ func (a *App) drainEvents() bool {
 		select {
 		case event := <-a.events:
 			dirty = true
+			if event.autoSync != 0 {
+				if event.autoSync == a.syncSerial && !a.syncRunning {
+					a.sync()
+				}
+				continue
+			}
+			if event.syncDone {
+				a.syncRunning = false
+				a.scheduleAutoSync()
+			}
 			if event.reload {
 				a.reload()
 			}
-			a.status = event.status
-			a.error = event.error
+			if event.clearSelectionAt != 0 && event.clearSelectionAt == a.selectToken && !a.selectActive {
+				a.clearSelection()
+			}
+			if event.status != "" {
+				a.status = event.status
+				a.error = event.error
+			}
+			if event.status == "" && event.error {
+				a.error = true
+			}
 		default:
 			return dirty
 		}
@@ -231,6 +259,10 @@ func (a *App) handle(key string) bool {
 	}
 	if a.actionScope == "filter" {
 		a.handleFilterAction(key)
+		return true
+	}
+	if a.actionScope == "link" {
+		a.handleLinkAction(key)
 		return true
 	}
 	switch key {
@@ -368,6 +400,34 @@ func (a *App) handleFilterAction(key string) {
 	}
 }
 
+func (a *App) handleLinkAction(key string) {
+	url := a.pendingURL
+	switch key {
+	case "enter":
+		if url != "" {
+			if err := openExternal(url); err != nil {
+				a.statusError(err.Error())
+			} else {
+				a.status = "opened " + url
+			}
+		}
+		a.pendingURL = ""
+		a.actionScope = ""
+	case "c":
+		if url != "" {
+			a.status = copyToClipboard(url)
+		}
+		a.pendingURL = ""
+		a.actionScope = ""
+	case "esc", "q", "x":
+		a.pendingURL = ""
+		a.actionScope = ""
+		a.status = ""
+	default:
+		a.status = "link: " + url + "  enter open  c copy  esc cancel"
+	}
+}
+
 func (a *App) searchPrompt() {
 	query, err := a.promptLine("search")
 	if err != nil {
@@ -414,6 +474,12 @@ func (a *App) handleMouse(key string) bool {
 		if release == "release" {
 			if a.selectActive {
 				a.updateSelection(x, y)
+				if samePoint(a.selectStart, a.selectEnd) {
+					if url := a.linkAtBodyPoint(x, y); url != "" {
+						a.confirmLink(url)
+						return true
+					}
+				}
 				a.finishSelection()
 				return true
 			}
@@ -448,6 +514,7 @@ func (a *App) startSelection(x, y int) {
 	a.selectStart = &p
 	a.selectEnd = &p
 	a.selectActive = true
+	a.selectToken++
 }
 
 func (a *App) updateSelection(x, y int) {
@@ -463,12 +530,51 @@ func (a *App) finishSelection() {
 		return
 	}
 	a.status = copyToClipboard(text)
+	token := a.selectToken
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		a.events <- event{clearSelectionAt: token}
+	}()
 }
 
 func (a *App) clearSelection() {
 	a.selectStart = nil
 	a.selectEnd = nil
 	a.selectActive = false
+	a.selectToken++
+}
+
+func samePoint(a, b *point) bool {
+	return a != nil && b != nil && a.line == b.line && a.col == b.col
+}
+
+func (a *App) linkAtBodyPoint(x, y int) string {
+	if a.preview == nil || !pointInArea(x, y, a.bodyArea) {
+		return ""
+	}
+	content := a.previewBody
+	if a.headerMode {
+		content = a.previewHead
+	}
+	lines := previewLines(a.preview, content, a.bodyArea.w)
+	lineIndex := a.bodyScroll + max(0, min(max(0, a.bodyArea.h-1), y-a.bodyArea.y))
+	if lineIndex < 0 || lineIndex >= len(lines) {
+		return ""
+	}
+	col := max(0, min(max(0, a.bodyArea.w-1), x-a.bodyArea.x))
+	for _, link := range markdownLinks(previewPlainText(lines[lineIndex])) {
+		if col >= link.start && col <= link.end {
+			return link.url
+		}
+	}
+	return ""
+}
+
+func (a *App) confirmLink(url string) {
+	a.clearSelection()
+	a.pendingURL = url
+	a.actionScope = "link"
+	a.status = "link: " + url + "  enter open  c copy  esc cancel"
 }
 
 func (a *App) bodyPoint(x, y int) point {
@@ -634,10 +740,17 @@ func (a *App) sync() {
 		a.statusError("no accounts")
 		return
 	}
+	if a.syncRunning {
+		a.status = "sync already running"
+		return
+	}
+	a.stopSyncTimer()
+	a.syncRunning = true
 	accounts := append([]store.Account(nil), a.accountsList...)
 	a.status = fmt.Sprintf("syncing 0/%d accounts...", len(accounts))
 	go func() {
 		defer a.reportPanic()
+		defer func() { a.events <- event{syncDone: true} }()
 		total := 0
 		post := func(status string) {
 			a.events <- event{status: status}
@@ -665,6 +778,22 @@ func (a *App) sync() {
 		}
 		a.events <- event{status: fmt.Sprintf("synced %d messages", total), reload: true}
 	}()
+}
+
+func (a *App) scheduleAutoSync() {
+	a.stopSyncTimer()
+	a.syncSerial++
+	serial := a.syncSerial
+	a.syncTimer = time.AfterFunc(5*time.Minute, func() {
+		a.events <- event{autoSync: serial}
+	})
+}
+
+func (a *App) stopSyncTimer() {
+	if a.syncTimer != nil {
+		a.syncTimer.Stop()
+		a.syncTimer = nil
+	}
 }
 
 func accountLabel(account store.Account) string {
@@ -773,6 +902,7 @@ func (a *App) sendDraft(account store.Account, parsed protocol.Draft) {
 			a.events <- event{status: err.Error(), error: true}
 			return
 		}
+		_, _ = a.store.ImportSent(account.ID, []byte(protocol.Message(account, parsed)))
 		a.store.RememberAddressStrings(parsed.From, parsed.To, parsed.Cc, parsed.Bcc)
 		_ = a.store.Flush()
 		if pgpStatus != "" {
@@ -867,12 +997,16 @@ func (a *App) openAttachment(att store.Attachment) {
 		a.statusError(err.Error())
 		return
 	}
+	_ = openExternal(path)
+	a.status = "opened " + filepath.Base(path)
+}
+
+func openExternal(target string) error {
 	cmdName := "xdg-open"
 	if _, err := exec.LookPath(cmdName); err != nil {
 		cmdName = "open"
 	}
-	_ = exec.Command(cmdName, path).Start()
-	a.status = "opened " + filepath.Base(path)
+	return exec.Command(cmdName, target).Start()
 }
 
 func (a *App) importAttachmentKey(att store.Attachment) {
@@ -1273,6 +1407,9 @@ func (a *App) shortcuts() string {
 	if a.actionScope == "filter" {
 		return "filter: s spam  e sent  D drafts  r read  u unread  d today  c clear  esc back"
 	}
+	if a.actionScope == "link" {
+		return "link: enter open  c copy  esc cancel"
+	}
 	parts := []string{"j/k move", "enter open", "SPC actions", "f filters", "/ search", "s sync", "c compose"}
 	if len(a.accountsList) > 1 {
 		parts = append(parts, "a acct")
@@ -1336,6 +1473,12 @@ func readKey() (string, error) {
 		return "", err
 	}
 	b := buf[0]
+	if b == 3 {
+		return "ctrl-c", nil
+	}
+	if b == 8 || b == 127 {
+		return "backspace", nil
+	}
 	if b == 13 || b == 10 {
 		return "enter", nil
 	}
@@ -1352,6 +1495,8 @@ func readKey() (string, error) {
 				return "up", nil
 			case 'B':
 				return "down", nil
+			case '3':
+				return "delete", nil
 			case '5':
 				return "pageup", nil
 			case '6':
@@ -1440,6 +1585,16 @@ func printRichLine(y, x, width int, text string) {
 	col := 0
 	bold, italic, under := false, false, false
 	for i := 0; i < len(text) && col < width; {
+		if raw, _, ok := markdownLinkAt(text, i); ok {
+			chunk := raw
+			if displayLen(chunk) > width-col {
+				chunk = clipRunes(chunk, width-col)
+			}
+			printSegment(y, x+col, width-col, chunk, styleLink)
+			col += displayLen(chunk)
+			i += len(raw)
+			continue
+		}
 		if strings.HasPrefix(text[i:], "**") {
 			bold = !bold
 			i += 2
@@ -1457,6 +1612,9 @@ func printRichLine(y, x, width int, text string) {
 		}
 		start := i
 		for i < len(text) && !strings.HasPrefix(text[i:], "**") && !strings.HasPrefix(text[i:], "__") && text[i] != '*' {
+			if _, _, ok := markdownLinkAt(text, i); ok {
+				break
+			}
 			i++
 		}
 		chunk := text[start:i]
@@ -1467,6 +1625,49 @@ func printRichLine(y, x, width int, text string) {
 		printSegment(y, x+col, width-col, chunk, style)
 		col += len(chunk)
 	}
+}
+
+type markdownLink struct {
+	start int
+	end   int
+	url   string
+}
+
+func markdownLinks(text string) []markdownLink {
+	out := []markdownLink{}
+	for i := 0; i < len(text); {
+		raw, url, ok := markdownLinkAt(text, i)
+		if !ok {
+			i++
+			continue
+		}
+		start := displayLen(text[:i])
+		out = append(out, markdownLink{start: start, end: start + displayLen(raw), url: url})
+		i += len(raw)
+	}
+	return out
+}
+
+func markdownLinkAt(text string, i int) (string, string, bool) {
+	if i >= len(text) || text[i] != '[' {
+		return "", "", false
+	}
+	labelEnd := strings.Index(text[i:], "](")
+	if labelEnd <= 1 {
+		return "", "", false
+	}
+	labelEnd += i
+	urlStart := labelEnd + 2
+	urlEnd := strings.IndexByte(text[urlStart:], ')')
+	if urlEnd <= 0 {
+		return "", "", false
+	}
+	urlEnd += urlStart
+	url := strings.TrimSpace(text[urlStart:urlEnd])
+	if url == "" || (!strings.HasPrefix(strings.ToLower(url), "http://") && !strings.HasPrefix(strings.ToLower(url), "https://") && !strings.HasPrefix(strings.ToLower(url), "mailto:")) {
+		return "", "", false
+	}
+	return text[i : urlEnd+1], url, true
 }
 
 func richPlainText(text string) string {
@@ -1530,24 +1731,53 @@ func (a *App) runEditor(path string) error {
 	err := compose.RunEditor(path)
 	_ = rawMode()
 	fmt.Print("\x1b[?1049h\x1b[?25l")
+	enableMouse()
 	return err
 }
 
 func (a *App) promptLine(label string) (string, error) {
-	_ = cookedMode()
 	w, h := terminalSize()
 	prompt := label + ": "
-	printStyledLine(h-2, 0, w, prompt, styleStatus)
-	fmt.Printf("\x1b[%d;%dH\x1b[?25h", h-1, len(prompt)+1)
-	reader := bufio.NewReader(os.Stdin)
-	value, err := reader.ReadString('\n')
-	fmt.Print("\x1b[?25l")
-	_ = rawMode()
-	a.dirty = true
-	if err != nil {
-		return "", err
+	var value strings.Builder
+	fmt.Print("\x1b[?25h")
+	defer func() {
+		fmt.Print("\x1b[?25l")
+		a.dirty = true
+	}()
+	for {
+		printStyledLine(h-2, 0, w, prompt+value.String(), styleStatus)
+		fmt.Printf("\x1b[%d;%dH", h-1, min(w, len(prompt)+displayLen(value.String()))+1)
+		key, err := readKeyBlocking()
+		if err != nil {
+			return "", err
+		}
+		switch key {
+		case "enter":
+			return value.String(), nil
+		case "esc":
+			return "", nil
+		case "backspace", "delete":
+			removeLastRune(&value)
+		case "ctrl-c":
+			return "", nil
+		case "space":
+			value.WriteByte(' ')
+		default:
+			if len(key) == 1 && key[0] >= 32 && key[0] != 127 {
+				value.WriteString(key)
+			}
+		}
 	}
-	return strings.TrimRight(value, "\r\n"), nil
+}
+
+func removeLastRune(value *strings.Builder) {
+	text := value.String()
+	if text == "" {
+		return
+	}
+	runes := []rune(text)
+	value.Reset()
+	value.WriteString(string(runes[:len(runes)-1]))
 }
 
 func quote(body string) string {
@@ -1858,16 +2088,16 @@ func wrap(text string, width int) []string {
 	}
 	out := []string{}
 	for _, raw := range strings.Split(text, "\n") {
-		line := raw
-		if line == "" {
+		line := []rune(raw)
+		if len(line) == 0 {
 			out = append(out, "")
 			continue
 		}
 		for len(line) > width {
-			out = append(out, line[:width])
+			out = append(out, string(line[:width]))
 			line = line[width:]
 		}
-		out = append(out, line)
+		out = append(out, string(line))
 	}
 	return out
 }

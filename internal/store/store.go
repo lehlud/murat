@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	cryptobox "lehnert.dev/murat/internal/crypto"
 )
@@ -256,6 +257,18 @@ func (s *Store) normalize() {
 		msg.store = s
 		if decoded := decodeHeader(msg.Subject); decoded != msg.Subject {
 			msg.Subject = decoded
+			s.dirty = true
+		}
+		if decoded := decodeAddressHeader(msg.From); decoded != msg.From {
+			msg.From = decoded
+			s.dirty = true
+		}
+		if decoded := decodeAddressHeaders(msg.To); !equalStringSlice(decoded, msg.To) {
+			msg.To = decoded
+			s.dirty = true
+		}
+		if decoded := decodeAddressHeaders(msg.Cc); !equalStringSlice(decoded, msg.Cc) {
+			msg.Cc = decoded
 			s.dirty = true
 		}
 	}
@@ -558,6 +571,17 @@ func (s *Store) ImportRaw(raw []byte) (*Message, error) {
 	return msg, nil
 }
 
+func (s *Store) ImportSent(accountID string, raw []byte) (*Message, error) {
+	msg, err := s.ImportRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	msg.SetRemote(accountID, "")
+	msg.SetRead(true)
+	msg.SetTags([]string{"sent"})
+	return msg, nil
+}
+
 func (s *Store) OpenBody(msg *Message) (*Body, error) {
 	if msg != nil && msg.IsDraft() {
 		body := s.DraftBody(msg)
@@ -741,26 +765,28 @@ func (m *Message) FolderColumn() string {
 		return ""
 	}
 	if m.IsDraft() {
-		return "d"
+		return "draft"
 	}
 	candidates := m.folderTags()
 	if len(candidates) == 0 {
 		candidates = m.Tags
 	}
 	if len(candidates) == 0 && m.Spam {
-		return "j"
+		return "spam"
 	}
 	resolved := m.resolveMailboxInfos(candidates)
 	for _, box := range resolved {
 		switch normalizedMailboxRole(box.Role) {
 		case "inbox":
-			return "i"
+			return "in"
 		case "sent":
-			return "o"
+			return "out"
 		case "junk", "spam":
-			return "j"
+			return "spam"
 		case "drafts", "draft":
-			return "d"
+			return "draft"
+		case "trash", "deleted":
+			return "trash"
 		}
 	}
 	for _, box := range resolved {
@@ -774,12 +800,12 @@ func (m *Message) FolderColumn() string {
 		}
 	}
 	if m.Spam {
-		return "j"
+		return "spam"
 	}
 	if m.IsSent() {
-		return "o"
+		return "out"
 	}
-	return "i"
+	return "in"
 }
 
 func (m *Message) addTag(tag string) {
@@ -920,7 +946,7 @@ func (s *Store) mailboxPath(id string, byID map[string]mailboxInfo, seen map[str
 
 func normalizedMailboxRole(role string) string {
 	role = strings.ToLower(strings.TrimSpace(role))
-	if role == "junk" || role == "spam" {
+	if role == "junk" || role == "spam" || role == "trash" || role == "deleted" {
 		return role
 	}
 	return role
@@ -930,13 +956,17 @@ func folderMarkerFromName(name string) string {
 	base := strings.ToLower(folderBaseName(name))
 	switch base {
 	case "inbox", "posteingang":
-		return "i"
+		return "in"
 	case "sent", "sent mail", "sent messages", "sent items", "sent-mail", "sentmail", "outbox", "gesendet", "gesendete elemente", "gesendete objekte":
-		return "o"
+		return "out"
 	case "spam", "junk", "junk e-mail", "junk mail", "bulk mail":
-		return "j"
+		return "spam"
 	case "drafts", "draft", "entwürfe", "entwuerfe":
-		return "d"
+		return "draft"
+	case "trash", "bin", "deleted", "deleted items", "gelöscht", "geloescht", "gelöschte elemente", "geloeschte elemente", "gelöschte objekte", "geloeschte objekte", "papierkorb":
+		return "trash"
+	case "archive", "archiv":
+		return "arch"
 	default:
 		return ""
 	}
@@ -1271,7 +1301,7 @@ func messageFromMail(key string, parsed *mail.Message, raw []byte, rel string, h
 	}
 	return &Message{
 		Key:           key,
-		From:          parsed.Header.Get("From"),
+		From:          decodeAddressHeader(parsed.Header.Get("From")),
 		To:            splitAddressHeader(parsed.Header.Get("To")),
 		Cc:            splitAddressHeader(parsed.Header.Get("Cc")),
 		Subject:       decodeHeader(parsed.Header.Get("Subject")),
@@ -1533,6 +1563,9 @@ func decodeBytes(data []byte, charset string) string {
 	charset = strings.ToLower(strings.TrimSpace(charset))
 	switch charset {
 	case "", "utf-8", "us-ascii":
+		if !utf8.Valid(data) {
+			return decodeWindows1252(data)
+		}
 		return string(data)
 	case "iso-8859-1", "latin1", "latin-1":
 		runes := make([]rune, len(data))
@@ -1540,11 +1573,31 @@ func decodeBytes(data []byte, charset string) string {
 			runes[i] = rune(b)
 		}
 		return string(runes)
+	case "iso-8859-2", "latin2", "latin-2":
+		return decodeISO88592(data)
 	case "windows-1252", "cp1252":
 		return decodeWindows1252(data)
 	default:
 		return string(data)
 	}
+}
+
+func decodeISO88592(data []byte) string {
+	table := map[byte]rune{
+		0xA1: 'Ą', 0xA2: '˘', 0xA3: 'Ł', 0xA5: 'Ľ', 0xA6: 'Ś', 0xA9: 'Š', 0xAA: 'Ş', 0xAB: 'Ť', 0xAC: 'Ź', 0xAE: 'Ž', 0xAF: 'Ż',
+		0xB1: 'ą', 0xB2: '˛', 0xB3: 'ł', 0xB5: 'ľ', 0xB6: 'ś', 0xB7: 'ˇ', 0xB9: 'š', 0xBA: 'ş', 0xBB: 'ť', 0xBC: 'ź', 0xBD: '˝', 0xBE: 'ž', 0xBF: 'ż',
+		0xC0: 'Ŕ', 0xC3: 'Ă', 0xC5: 'Ĺ', 0xC6: 'Ć', 0xC8: 'Č', 0xCA: 'Ę', 0xCC: 'Ě', 0xCF: 'Ď', 0xD0: 'Đ', 0xD1: 'Ń', 0xD2: 'Ň', 0xD5: 'Ő', 0xD8: 'Ř', 0xD9: 'Ů', 0xDB: 'Ű', 0xDE: 'Ţ',
+		0xE0: 'ŕ', 0xE3: 'ă', 0xE5: 'ĺ', 0xE6: 'ć', 0xE8: 'č', 0xEA: 'ę', 0xEC: 'ě', 0xEF: 'ď', 0xF0: 'đ', 0xF1: 'ń', 0xF2: 'ň', 0xF5: 'ő', 0xF8: 'ř', 0xF9: 'ů', 0xFB: 'ű', 0xFE: 'ţ', 0xFF: '˙',
+	}
+	runes := make([]rune, len(data))
+	for i, b := range data {
+		if r, ok := table[b]; ok {
+			runes[i] = r
+		} else {
+			runes[i] = rune(b)
+		}
+	}
+	return string(runes)
 }
 
 func decodeWindows1252(data []byte) string {
@@ -1588,6 +1641,7 @@ var htmlSpaceRE = regexp.MustCompile(`[ \t\f\v]+`)
 var htmlNewlineSpaceRE = regexp.MustCompile(` *\n *`)
 var htmlManyNewlinesRE = regexp.MustCompile(`\n{3,}`)
 var htmlStyleRE = regexp.MustCompile(`(?is)\bstyle\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
+var htmlHrefRE = regexp.MustCompile(`(?is)\bhref\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
 var htmlFontWeightRE = regexp.MustCompile(`font-weight\s*:\s*[6-9]00`)
 
 func htmlToRichText(value string) string {
@@ -1602,6 +1656,7 @@ type htmlMarkers struct {
 	bold      bool
 	italic    bool
 	underline bool
+	link      string
 }
 
 func extractHTMLRichText(value string) (string, bool) {
@@ -1684,6 +1739,9 @@ func extractHTMLRichText(value string) (string, bool) {
 			continue
 		}
 		markers := htmlMarkersFor(tag, htmlStyle(tagText))
+		if tag == "a" {
+			markers.link = htmlHref(tagText)
+		}
 		stack = append(stack, markers)
 		writeHTMLMarkerOpen(&out, markers)
 		if selfClosing {
@@ -1716,7 +1774,15 @@ func htmlTagName(tagText string) string {
 }
 
 func htmlStyle(tagText string) string {
-	match := htmlStyleRE.FindStringSubmatch(tagText)
+	return htmlAttrValue(tagText, htmlStyleRE)
+}
+
+func htmlHref(tagText string) string {
+	return htmlpkg.UnescapeString(htmlAttrValue(tagText, htmlHrefRE))
+}
+
+func htmlAttrValue(tagText string, re *regexp.Regexp) string {
+	match := re.FindStringSubmatch(tagText)
 	if len(match) < 2 {
 		return ""
 	}
@@ -1741,6 +1807,9 @@ func htmlNewline(out *strings.Builder) {
 }
 
 func writeHTMLMarkerOpen(out *strings.Builder, markers htmlMarkers) {
+	if markers.link != "" {
+		out.WriteString("[")
+	}
 	if markers.bold {
 		out.WriteString("**")
 	}
@@ -1762,21 +1831,74 @@ func writeHTMLMarkerClose(out *strings.Builder, markers htmlMarkers) {
 	if markers.bold {
 		out.WriteString("**")
 	}
+	if markers.link != "" {
+		out.WriteString("](")
+		out.WriteString(markers.link)
+		out.WriteString(")")
+	}
 }
 
 func splitAddressHeader(value string) []string {
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}
-	addrs, err := mail.ParseAddressList(value)
+	parser := mail.AddressParser{WordDecoder: &mime.WordDecoder{CharsetReader: charsetReader}}
+	addrs, err := parser.ParseList(value)
 	if err != nil {
-		return []string{value}
+		return []string{decodeHeader(value)}
 	}
 	out := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
-		out = append(out, addr.String())
+		out = append(out, displayAddress(addr))
 	}
 	return out
+}
+
+func decodeAddressHeader(value string) string {
+	items := splitAddressHeader(value)
+	if len(items) == 0 {
+		return ""
+	}
+	return strings.Join(items, ", ")
+}
+
+func decodeAddressHeaders(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	out := []string{}
+	for _, value := range values {
+		out = append(out, splitAddressHeader(value)...)
+	}
+	return out
+}
+
+func displayAddress(addr *mail.Address) string {
+	if addr == nil {
+		return ""
+	}
+	name := strings.TrimSpace(addr.Name)
+	if name == "" {
+		return addr.Address
+	}
+	if strings.ContainsAny(name, `",;<>`) {
+		name = strings.ReplaceAll(name, `\`, `\\`)
+		name = strings.ReplaceAll(name, `"`, `\"`)
+		name = `"` + name + `"`
+	}
+	return name + " <" + addr.Address + ">"
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func headerText(raw []byte) string {

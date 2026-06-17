@@ -429,6 +429,7 @@ func cmdCompose(args []string) error {
 		fmt.Fprintln(os.Stderr, status)
 	}
 	if s, err := openStore(); err == nil {
+		_, _ = s.ImportSent(account.ID, []byte(protocol.Message(account, draft)))
 		s.RememberAddressStrings(draft.From, draft.To, draft.Cc, draft.Bcc)
 		_ = s.Flush()
 	}

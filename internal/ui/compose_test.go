@@ -38,3 +38,13 @@ func TestToggleSelfEncryptEnablesEncrypt(t *testing.T) {
 		t.Fatalf("PGP options after disabling encrypt = %q", draft.PGP)
 	}
 }
+
+func TestMarkdownLinks(t *testing.T) {
+	links := markdownLinks("Read [the docs](https://example.com) now")
+	if len(links) != 1 {
+		t.Fatalf("links = %#v", links)
+	}
+	if links[0].start != 5 || links[0].end != 36 || links[0].url != "https://example.com" {
+		t.Fatalf("link = %#v", links[0])
+	}
+}

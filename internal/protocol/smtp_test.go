@@ -18,7 +18,7 @@ func TestMultipartMessageIncludesAttachment(t *testing.T) {
 			Data:        []byte("public key"),
 		}},
 	}
-	msg := message(store.Account{Email: "a@example.com"}, draft)
+	msg := Message(store.Account{Email: "a@example.com"}, draft)
 	for _, want := range []string{
 		"Content-Type: multipart/mixed; boundary=",
 		"Content-Type: text/plain; charset=utf-8",
@@ -34,7 +34,7 @@ func TestMultipartMessageIncludesAttachment(t *testing.T) {
 }
 
 func TestMessageUsesDraftFrom(t *testing.T) {
-	msg := message(store.Account{Email: "fallback@example.com"}, Draft{From: "Alice <alice@example.com>", To: "bob@example.com", Body: "body"})
+	msg := Message(store.Account{Email: "fallback@example.com"}, Draft{From: "Alice <alice@example.com>", To: "bob@example.com", Body: "body"})
 	if !strings.Contains(msg, "From: Alice <alice@example.com>") {
 		t.Fatalf("message = %q", msg)
 	}

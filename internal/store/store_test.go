@@ -84,6 +84,14 @@ func TestHTMLToRichText(t *testing.T) {
 	}
 }
 
+func TestHTMLToRichTextPreservesAnchors(t *testing.T) {
+	got := htmlToRichText(`<p>Read <a href="https://example.com?a=1&amp;b=2">the docs</a>.</p>`)
+	want := "Read [the docs](https://example.com?a=1&b=2)."
+	if got != want {
+		t.Fatalf("htmlToRichText() = %q, want %q", got, want)
+	}
+}
+
 func TestDecodeWindows1252Body(t *testing.T) {
 	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: cp1252\r\nContent-Type: text/plain; charset=windows-1252\r\n\r\n\x93hello\x94 \x80\r\n")
 	_, body, _, err := parseRaw(raw)
@@ -91,6 +99,28 @@ func TestDecodeWindows1252Body(t *testing.T) {
 		t.Fatal(err)
 	}
 	if body != "“hello” €" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestDecodeInvalidUTF8BodyAsWindows1252(t *testing.T) {
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: latin1-missing-charset\r\nContent-Type: text/plain\r\n\r\nUniversit\xe4tsorchester Pr\xe9ludes Besch\xe4ftigten\r\n")
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "Universitätsorchester Préludes Beschäftigten" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestDecodeISO88592Body(t *testing.T) {
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: latin2\r\nContent-Type: text/plain; charset=iso-8859-2\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nUniversit=E4tsorchester Pr=E9ludes Dole=BEel\r\n")
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "Universitätsorchester Préludes Doležel" {
 		t.Fatalf("body = %q", body)
 	}
 }
@@ -119,6 +149,37 @@ func TestNormalizeDecodesStoredMIMEEncodedSubject(t *testing.T) {
 	}
 }
 
+func TestDecodeMIMEEncodedAddresses(t *testing.T) {
+	raw := []byte("From: =?Cp1252?Q?Einstellung_Hilfskr=E4fte?= <no-reply@rrze.uni-erlangen.de>\r\nTo: =?utf-8?Q?Ludwig_Lehnert?= <ludwig.lehnert@fau.de>\r\nSubject: x\r\nDate: Sun, 15 Jun 2026 11:00:48 +0000\r\n\r\nbody\r\n")
+	parsed, _, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := messageFromMail("key", parsed, raw, "key.eml.enc", false)
+	if msg.From != "Einstellung Hilfskräfte <no-reply@rrze.uni-erlangen.de>" {
+		t.Fatalf("from = %q", msg.From)
+	}
+	if len(msg.To) != 1 || msg.To[0] != "Ludwig Lehnert <ludwig.lehnert@fau.de>" {
+		t.Fatalf("to = %#v", msg.To)
+	}
+}
+
+func TestNormalizeDecodesStoredMIMEEncodedAddresses(t *testing.T) {
+	s := &Store{index: emptyIndex()}
+	s.index.Messages["m"] = &Message{Key: "m", From: "=?Cp1252?Q?Einstellung_Hilfskr=E4fte?= <no-reply@rrze.uni-erlangen.de>", To: []string{"=?utf-8?Q?Ludwig_Lehnert?= <ludwig.lehnert@fau.de>"}}
+	s.normalize()
+	msg := s.index.Messages["m"]
+	if msg.From != "Einstellung Hilfskräfte <no-reply@rrze.uni-erlangen.de>" {
+		t.Fatalf("from = %q", msg.From)
+	}
+	if len(msg.To) != 1 || msg.To[0] != "Ludwig Lehnert <ludwig.lehnert@fau.de>" {
+		t.Fatalf("to = %#v", msg.To)
+	}
+	if !s.dirty {
+		t.Fatal("expected store dirty after address migration")
+	}
+}
+
 func TestKnownRemoteIDs(t *testing.T) {
 	s := &Store{index: emptyIndex()}
 	s.index.Messages["a"] = &Message{AccountID: "acct", RemoteID: "imap:INBOX:1"}
@@ -129,6 +190,23 @@ func TestKnownRemoteIDs(t *testing.T) {
 	}
 	if known["imap:INBOX:2"] {
 		t.Fatal("unexpected other account remote id")
+	}
+}
+
+func TestImportSentMarksMessageSent(t *testing.T) {
+	dir := t.TempDir()
+	paths := testPaths(dir)
+	s, err := Open(paths, bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: sent\r\nDate: Tue, 09 Jun 2026 10:00:00 +0000\r\n\r\nbody\r\n")
+	msg, err := s.ImportSent("acct", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.AccountID != "acct" || !msg.Read || !msg.IsSent() {
+		t.Fatalf("sent msg = %#v", msg)
 	}
 }
 
@@ -163,14 +241,19 @@ func TestFolderColumnResolvesMailboxIDs(t *testing.T) {
 		map[string]any{"id": "a", "name": "INBOX", "role": "inbox"},
 		map[string]any{"id": "b", "name": "Archive", "role": ""},
 		map[string]any{"id": "c", "name": "2026", "parentId": "b"},
+		map[string]any{"id": "d", "name": "Gelöscht", "role": ""},
 	}
 	msg := &Message{store: s, AccountID: "acct", Tags: []string{"a"}}
-	if got := msg.FolderColumn(); got != "i" {
+	if got := msg.FolderColumn(); got != "in" {
 		t.Fatalf("inbox marker = %q", got)
 	}
 	msg.Tags = []string{"c"}
 	if got := msg.FolderColumn(); got != "2026" {
 		t.Fatalf("basename marker = %q", got)
+	}
+	msg.Tags = []string{"d"}
+	if got := msg.FolderColumn(); got != "trash" {
+		t.Fatalf("deleted marker = %q", got)
 	}
 }
 

@@ -82,14 +82,14 @@ func SendSMTPS(account store.Account, draft Draft) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.Write([]byte(message(account, draft)))
+	_, err = w.Write([]byte(Message(account, draft)))
 	if closeErr := w.Close(); err == nil {
 		err = closeErr
 	}
 	return err
 }
 
-func message(account store.Account, draft Draft) string {
+func Message(account store.Account, draft Draft) string {
 	if len(draft.Attachments) > 0 {
 		return multipartMessage(account, draft)
 	}
