@@ -190,12 +190,6 @@ file-types = [{ glob = "murat-compose-*.txt" }, { glob = "**/murat-compose-*.txt
 language-servers = ["murat"]
 ```
 
-## Compatibility Notes
-
-The Go client intentionally uses the Python `murat` data locations and encryption envelope so both clients can share a store.
-
-Mail metadata is kept in encrypted JSON; raw EML files are encrypted separately, so previewing message metadata does not require decrypting every raw mail blob.
-
 ## Security Notes
 
 - Local store encryption depends on your `gpg` key protection and local machine security.
