@@ -18,6 +18,7 @@ import (
 	"lehnert.dev/murat/internal/protocol"
 	"lehnert.dev/murat/internal/store"
 	"lehnert.dev/murat/internal/ui"
+	"lehnert.dev/murat/internal/userdirs"
 )
 
 var commit = "dev"
@@ -320,9 +321,11 @@ func cmdSaveAttachments(args []string) error {
 	if len(args) < 1 || len(args) > 2 {
 		return fmt.Errorf("usage: murat save-attachments MESSAGE [DIR]")
 	}
-	dir := "."
+	dir := userdirs.Downloads()
 	if len(args) == 2 {
 		dir = args[1]
+	} else if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
 	s, err := openStore()
 	if err != nil {

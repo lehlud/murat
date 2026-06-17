@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"lehnert.dev/murat/internal/pgp"
 	"lehnert.dev/murat/internal/protocol"
 	"lehnert.dev/murat/internal/store"
+	"lehnert.dev/murat/internal/userdirs"
 )
 
 const (
@@ -1020,15 +1022,29 @@ func (a *App) importAttachmentKey(att store.Attachment) {
 }
 
 func (a *App) saveAttachment(att store.Attachment) {
-	defaultPath := filepath.Join(os.Getenv("HOME"), safeName(att.Filename))
-	target, err := a.promptLine("save as [" + defaultPath + "]")
+	defaultPath := filepath.Join(userdirs.Downloads(), safeName(att.Filename))
+	target, cancelled, err := a.promptPath("save as", defaultPath)
 	if err != nil {
 		a.statusError(err.Error())
 		return
 	}
+	if cancelled {
+		a.status = ""
+		return
+	}
 	target = strings.TrimSpace(target)
+	usingDefault := false
 	if target == "" {
 		target = defaultPath
+		usingDefault = true
+	} else {
+		target = userdirs.Expand(target)
+	}
+	if usingDefault {
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			a.statusError(err.Error())
+			return
+		}
 	}
 	if stat, err := os.Stat(target); err == nil && stat.IsDir() {
 		target = filepath.Join(target, safeName(att.Filename))
@@ -1482,6 +1498,9 @@ func readKey() (string, error) {
 	if b == 13 || b == 10 {
 		return "enter", nil
 	}
+	if b == 9 {
+		return "tab", nil
+	}
 	if b == 27 {
 		_ = timedRawMode()
 		seq := readEscapeTail()
@@ -1736,8 +1755,18 @@ func (a *App) runEditor(path string) error {
 }
 
 func (a *App) promptLine(label string) (string, error) {
+	value, _, err := a.promptInput(label+": ", nil)
+	return value, err
+}
+
+func (a *App) promptPath(label, defaultValue string) (string, bool, error) {
+	return a.promptInput(label+" ["+defaultValue+"]: ", func(value string) string {
+		return completeDirectoryPath(value, filepath.Dir(defaultValue))
+	})
+}
+
+func (a *App) promptInput(prompt string, complete func(string) string) (string, bool, error) {
 	w, h := terminalSize()
-	prompt := label + ": "
 	var value strings.Builder
 	fmt.Print("\x1b[?25h")
 	defer func() {
@@ -1749,17 +1778,23 @@ func (a *App) promptLine(label string) (string, error) {
 		fmt.Printf("\x1b[%d;%dH", h-1, min(w, len(prompt)+displayLen(value.String()))+1)
 		key, err := readKeyBlocking()
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		switch key {
 		case "enter":
-			return value.String(), nil
+			return value.String(), false, nil
 		case "esc":
-			return "", nil
+			return "", true, nil
 		case "backspace", "delete":
 			removeLastRune(&value)
+		case "tab":
+			if complete != nil {
+				completed := complete(value.String())
+				value.Reset()
+				value.WriteString(completed)
+			}
 		case "ctrl-c":
-			return "", nil
+			return "", true, nil
 		case "space":
 			value.WriteByte(' ')
 		default:
@@ -1768,6 +1803,60 @@ func (a *App) promptLine(label string) (string, error) {
 			}
 		}
 	}
+}
+
+func completeDirectoryPath(input, fallbackDir string) string {
+	if input == "" {
+		return withTrailingSeparator(fallbackDir)
+	}
+	dirPart, prefix := filepath.Split(input)
+	scan := dirPart
+	if scan == "" {
+		scan = "."
+	}
+	entries, err := os.ReadDir(userdirs.Expand(scan))
+	if err != nil {
+		return input
+	}
+	matches := []string{}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		matches = append(matches, entry.Name())
+	}
+	if len(matches) == 0 {
+		return input
+	}
+	sort.Strings(matches)
+	if len(matches) == 1 {
+		return withTrailingSeparator(dirPart + matches[0])
+	}
+	common := commonPrefix(matches)
+	if len(common) > len(prefix) {
+		return dirPart + common
+	}
+	return input
+}
+
+func commonPrefix(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	prefix := values[0]
+	for _, value := range values[1:] {
+		for !strings.HasPrefix(value, prefix) && prefix != "" {
+			prefix = prefix[:len(prefix)-1]
+		}
+	}
+	return prefix
+}
+
+func withTrailingSeparator(path string) string {
+	if path == "" || strings.HasSuffix(path, string(os.PathSeparator)) {
+		return path
+	}
+	return path + string(os.PathSeparator)
 }
 
 func removeLastRune(value *strings.Builder) {
