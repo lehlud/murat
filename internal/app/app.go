@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"lehnert.dev/murat/internal/compose"
+	"lehnert.dev/murat/internal/config"
 	"lehnert.dev/murat/internal/lsp"
 	"lehnert.dev/murat/internal/pgp"
 	"lehnert.dev/murat/internal/protocol"
@@ -78,6 +79,13 @@ func cmdInit(args []string) error {
 		return err
 	}
 	paths := store.DefaultPaths()
+	if strings.TrimSpace(*gpg) == "" {
+		cfg, err := config.Load(paths.ConfigFile)
+		if err != nil {
+			return err
+		}
+		*gpg = cfg.Crypto.GPGRecipient
+	}
 	if _, err := store.EnsureKey(paths, *gpg); err != nil {
 		return err
 	}
@@ -291,7 +299,8 @@ func cmdOpen(args []string) error {
 	if err != nil {
 		return err
 	}
-	text, status, _ := pgp.ProcessText(body.Text)
+	attachments, _ := s.Attachments(msg)
+	text, status, _ := pgp.ProcessTextWithKeys(body.Text, publicKeyAttachmentData(attachments))
 	fmt.Println(body.Headers)
 	fmt.Println()
 	fmt.Println(text)
@@ -299,6 +308,16 @@ func cmdOpen(args []string) error {
 		fmt.Fprintln(os.Stderr, status)
 	}
 	return s.Flush()
+}
+
+func publicKeyAttachmentData(attachments []store.Attachment) [][]byte {
+	keys := [][]byte{}
+	for _, attachment := range attachments {
+		if pgp.IsPublicKeyAttachment(attachment.Filename, attachment.ContentType, attachment.Data) {
+			keys = append(keys, attachment.Data)
+		}
+	}
+	return keys
 }
 
 func cmdRead(args []string, read bool) error {
@@ -351,11 +370,23 @@ func cmdTUI(args []string) error {
 	if err != nil {
 		return err
 	}
+	cfg, err := config.Load(s.Paths().ConfigFile)
+	if err != nil {
+		return err
+	}
 	accounts, err := openAccounts()
 	if err != nil {
 		return err
 	}
-	return ui.Run(s, accounts)
+	return ui.Run(s, accounts, ui.Options{
+		PGPDefaults: cfg.PGPOptions(),
+		PGPIdentity: cfg.Crypto.GPGRecipient,
+		Theme:       ui.ThemeFromConfig(cfg.Theme),
+		Keys:        ui.KeysFromConfig(cfg.Keys),
+		Editor:      cfg.UI.Editor,
+		Split:       cfg.UI.Split,
+		PageSize:    cfg.UI.PageSize,
+	})
 }
 
 func cmdLSP() error {
@@ -388,6 +419,13 @@ func cmdCompose(args []string) error {
 		return err
 	}
 	draft := protocol.Draft{From: *from, To: *to, Cc: *cc, Bcc: *bcc, Subject: *subject, PGP: *pgpOpt}
+	cfg, err := config.Load(store.DefaultPaths().ConfigFile)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(draft.PGP) == "" {
+		draft.PGP = cfg.PGPOptions()
+	}
 	if strings.TrimSpace(draft.From) == "" {
 		draft.From = account.Email
 	}
@@ -398,7 +436,7 @@ func cmdCompose(args []string) error {
 		}
 		draft.Body = string(body)
 	} else if stdinIsTerminal() {
-		draft, err = compose.Edit(draft)
+		draft, err = compose.EditWithEditor(draft, cfg.UI.Editor)
 		if err != nil {
 			return err
 		}
@@ -416,7 +454,7 @@ func cmdCompose(args []string) error {
 	if err != nil {
 		return err
 	}
-	draft, status, err := pgp.ApplyDraft(senderEmail(draft.From), draft)
+	draft, status, err := pgp.ApplyDraft(pgpIdentity(senderEmail(draft.From), cfg.Crypto.GPGRecipient), draft)
 	if err != nil {
 		return err
 	}
@@ -469,10 +507,26 @@ func senderEmail(value string) string {
 	return value
 }
 
+func pgpIdentity(sender, configured string) string {
+	configured = strings.TrimSpace(configured)
+	if configured != "" && (sender == "" || !pgp.HasSecretKey(sender)) {
+		return configured
+	}
+	return sender
+}
+
 func cmdSync(args []string) error {
+	cfg, err := config.Load(store.DefaultPaths().ConfigFile)
+	if err != nil {
+		return err
+	}
+	defaultLimit := 100
+	if cfg.UI.PageSize > 0 {
+		defaultLimit = cfg.UI.PageSize
+	}
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	accountID := fs.String("account", "", "account id/email")
-	limit := fs.Int("limit", 100, "max messages per account; 0 = all")
+	limit := fs.Int("limit", defaultLimit, "max messages per account; 0 = all")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

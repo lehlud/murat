@@ -27,10 +27,23 @@ func SyncIMAPS(account store.Account, s *store.Store, limit int, progress func(s
 	if err := client.login(account.Username, account.Secret); err != nil {
 		return 0, err
 	}
-	mailbox := account.IMAPMailbox
-	if mailbox == "" {
-		mailbox = "INBOX"
+	mailboxes := imapSyncMailboxes(account.IMAPMailbox)
+	if listed, err := client.listMailboxes(); err == nil {
+		mailboxes = imapSyncMailboxes(account.IMAPMailbox, sentIMAPMailbox(listed))
 	}
+	known := s.KnownRemoteIDs(account.ID)
+	count := 0
+	for _, mailbox := range mailboxes {
+		added, err := syncIMAPMailbox(client, account.ID, s, mailbox, known, limit, progress)
+		count += added
+		if err != nil {
+			return count, err
+		}
+	}
+	return count, s.Flush()
+}
+
+func syncIMAPMailbox(client *IMAPClient, accountID string, s *store.Store, mailbox string, known map[string]bool, limit int, progress func(string)) (int, error) {
 	if err := client.selectMailbox(mailbox); err != nil {
 		return 0, err
 	}
@@ -41,7 +54,6 @@ func SyncIMAPS(account store.Account, s *store.Store, limit int, progress func(s
 	if err != nil {
 		return 0, err
 	}
-	known := s.KnownRemoteIDs(account.ID)
 	uids = filterUnknownIMAPUIDs(uids, mailbox, known, limit)
 	if progress != nil {
 		progress(fmt.Sprintf("%d new messages", len(uids)))
@@ -60,13 +72,39 @@ func SyncIMAPS(account store.Account, s *store.Store, limit int, progress func(s
 		if err != nil {
 			return count, err
 		}
-		msg.SetRemote(account.ID, remoteID)
+		msg.SetRemote(accountID, remoteID)
 		msg.SetRead(strings.Contains(strings.ToLower(flags), "\\seen"))
 		msg.SetTags([]string{mailbox})
 		known[remoteID] = true
 		count++
 	}
-	return count, s.Flush()
+	return count, nil
+}
+
+func imapSyncMailboxes(primary string, extras ...string) []string {
+	if strings.TrimSpace(primary) == "" {
+		primary = "INBOX"
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, mailbox := range append([]string{primary}, extras...) {
+		mailbox = strings.TrimSpace(mailbox)
+		if mailbox == "" {
+			continue
+		}
+		key := strings.ToLower(mailbox)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, mailbox)
+	}
+	return out
+}
+
+type imapMailboxInfo struct {
+	name string
+	sent bool
 }
 
 func filterUnknownIMAPUIDs(uids []string, mailbox string, known map[string]bool, limit int) []string {
@@ -164,6 +202,111 @@ func (c *IMAPClient) login(username, password string) error {
 func (c *IMAPClient) selectMailbox(mailbox string) error {
 	_, err := c.command("SELECT %s", quoteIMAP(mailbox))
 	return err
+}
+
+func (c *IMAPClient) listMailboxes() ([]imapMailboxInfo, error) {
+	lines, err := c.command("LIST \"\" \"*\"")
+	if err != nil {
+		return nil, err
+	}
+	out := []imapMailboxInfo{}
+	for _, line := range lines {
+		mailbox, ok := parseIMAPListMailbox(line)
+		if ok {
+			out = append(out, mailbox)
+		}
+	}
+	return out, nil
+}
+
+func parseIMAPListMailbox(line string) (imapMailboxInfo, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(strings.ToUpper(line), "* LIST ") {
+		return imapMailboxInfo{}, false
+	}
+	flagsStart := strings.Index(line, "(")
+	if flagsStart < 0 {
+		return imapMailboxInfo{}, false
+	}
+	flagsEndRel := strings.Index(line[flagsStart:], ")")
+	if flagsEndRel < 0 {
+		return imapMailboxInfo{}, false
+	}
+	flagsEnd := flagsStart + flagsEndRel
+	flags := strings.ToLower(line[flagsStart+1 : flagsEnd])
+	rest := strings.TrimSpace(line[flagsEnd+1:])
+	_, rest, ok := readIMAPListToken(rest)
+	if !ok {
+		return imapMailboxInfo{}, false
+	}
+	name, _, ok := readIMAPListToken(rest)
+	if !ok || strings.TrimSpace(name) == "" {
+		return imapMailboxInfo{}, false
+	}
+	return imapMailboxInfo{name: name, sent: strings.Contains(flags, `\sent`) || sentIMAPMailboxName(name)}, true
+}
+
+func readIMAPListToken(text string) (string, string, bool) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", "", false
+	}
+	if text[0] != '"' {
+		fields := strings.Fields(text)
+		if len(fields) == 0 {
+			return "", "", false
+		}
+		return fields[0], strings.TrimSpace(strings.TrimPrefix(text, fields[0])), true
+	}
+	var out strings.Builder
+	escaped := false
+	for i := 1; i < len(text); i++ {
+		b := text[i]
+		if escaped {
+			out.WriteByte(b)
+			escaped = false
+			continue
+		}
+		if b == '\\' {
+			escaped = true
+			continue
+		}
+		if b == '"' {
+			return out.String(), strings.TrimSpace(text[i+1:]), true
+		}
+		out.WriteByte(b)
+	}
+	return "", "", false
+}
+
+func sentIMAPMailbox(boxes []imapMailboxInfo) string {
+	for _, box := range boxes {
+		if box.sent {
+			return box.name
+		}
+	}
+	return ""
+}
+
+func sentIMAPMailboxName(name string) bool {
+	base := strings.ToLower(imapMailboxBase(name))
+	switch base {
+	case "sent", "sent mail", "sent messages", "sent items", "sent-mail", "sentmail", "outbox", "gesendet", "gesendete elemente", "gesendete objekte":
+		return true
+	default:
+		return false
+	}
+}
+
+func imapMailboxBase(name string) string {
+	name = strings.TrimSpace(strings.ReplaceAll(name, "\\", "/"))
+	parts := strings.Split(name, "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		if part := strings.TrimSpace(parts[i]); part != "" {
+			return part
+		}
+	}
+	return name
 }
 
 func (c *IMAPClient) uidSearchAll() ([]string, error) {

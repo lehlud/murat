@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"mime"
 	"net/mail"
 	"os"
 	"os/exec"
@@ -15,28 +16,75 @@ import (
 	"time"
 
 	"lehnert.dev/murat/internal/compose"
+	"lehnert.dev/murat/internal/config"
 	"lehnert.dev/murat/internal/pgp"
 	"lehnert.dev/murat/internal/protocol"
 	"lehnert.dev/murat/internal/store"
 	"lehnert.dev/murat/internal/userdirs"
 )
 
-const (
-	styleReset    = "\x1b[0m"
-	styleHeader   = "\x1b[1;36m"
-	styleSelected = "\x1b[1;7m"
-	styleUnread   = "\x1b[1m"
-	styleStatus   = "\x1b[32m"
-	styleError    = "\x1b[1;31m"
-	styleDivider  = "\x1b[2;34m"
-	styleTag      = "\x1b[36m"
-	styleSpam     = "\x1b[1;33m"
-	styleDim      = "\x1b[2m"
-	styleLink     = "\x1b[34m"
+const styleReset = "\x1b[0m"
+
+var (
+	defaultTheme  = DefaultTheme()
+	styleHeader   = defaultTheme.Header
+	styleLabel    = defaultTheme.Label
+	styleSelected = defaultTheme.Selected
+	styleUnread   = defaultTheme.Unread
+	styleStatus   = defaultTheme.Status
+	styleError    = defaultTheme.Error
+	styleDivider  = defaultTheme.Divider
+	styleTag      = defaultTheme.Tag
+	styleSpam     = defaultTheme.Spam
+	styleDim      = defaultTheme.Dim
+	styleLink     = defaultTheme.Link
 	styleBold     = "\x1b[1m"
 	styleItalic   = "\x1b[3m"
 	styleUnder    = "\x1b[4m"
 )
+
+type Options struct {
+	PGPDefaults string
+	PGPIdentity string
+	Theme       Theme
+	Keys        Keys
+	Editor      string
+	Split       string
+	PageSize    int
+}
+
+type Theme struct {
+	Header   string
+	Label    string
+	Selected string
+	Unread   string
+	Status   string
+	Error    string
+	Divider  string
+	Tag      string
+	Spam     string
+	Dim      string
+	Link     string
+}
+
+type Keys struct {
+	Quit         string
+	ForceQuit    string
+	Sync         string
+	Compose      string
+	Filter       string
+	Actions      string
+	Open         string
+	Next         string
+	Prev         string
+	Down         string
+	Up           string
+	PageDown     string
+	PageUp       string
+	Top          string
+	Bottom       string
+	CycleAccount string
+}
 
 type area struct {
 	y int
@@ -82,6 +130,12 @@ type App struct {
 	syncRunning  bool
 	syncSerial   int
 	syncTimer    *time.Timer
+	pgpDefaults  string
+	keys         Keys
+	editor       string
+	split        string
+	pageSize     int
+	pgpIdentity  string
 	running      bool
 }
 
@@ -94,8 +148,335 @@ type event struct {
 	syncDone         bool
 }
 
-func Run(s *store.Store, accounts *store.AccountStore) error {
-	app := &App{store: s, accounts: accounts, events: make(chan event, 16), dirty: true, running: true}
+func DefaultTheme() Theme {
+	return Theme{
+		Header:   ansiCodes("1", rgbFG("05070a"), rgbBG("60a5fa")),
+		Label:    ansiCodes("2", rgbFG("8b949e")),
+		Selected: ansiCodes(rgbFG("ffffff"), rgbBG("1f6feb")),
+		Unread:   ansiCodes("1", rgbFG("f0f3f6")),
+		Status:   ansiCodes(rgbFG("4ade80")),
+		Error:    ansiCodes("1", rgbFG("ff6b7a")),
+		Divider:  ansiCodes("2", rgbFG("8b949e")),
+		Tag:      ansiCodes(rgbFG("c084fc")),
+		Spam:     ansiCodes("1", rgbFG("facc15")),
+		Dim:      ansiCodes("2", rgbFG("8b949e")),
+		Link:     ansiCodes("4", rgbFG("60a5fa")),
+	}
+}
+
+func ThemeFromConfig(cfg config.ThemeConfig) Theme {
+	theme := DefaultTheme()
+	if cfg.Header != "" {
+		theme.Header = ansiStyle(cfg.Header, theme.Header)
+	}
+	if cfg.Label != "" {
+		theme.Label = ansiStyle(cfg.Label, theme.Label)
+	}
+	if cfg.Selected != "" {
+		theme.Selected = ansiStyle(cfg.Selected, theme.Selected)
+	}
+	if cfg.Unread != "" {
+		theme.Unread = ansiStyle(cfg.Unread, theme.Unread)
+	}
+	if cfg.Status != "" {
+		theme.Status = ansiStyle(cfg.Status, theme.Status)
+	}
+	if cfg.Error != "" {
+		theme.Error = ansiStyle(cfg.Error, theme.Error)
+	}
+	if cfg.Divider != "" {
+		theme.Divider = ansiStyle(cfg.Divider, theme.Divider)
+	}
+	if cfg.Tag != "" {
+		theme.Tag = ansiStyle(cfg.Tag, theme.Tag)
+	}
+	if cfg.Spam != "" {
+		theme.Spam = ansiStyle(cfg.Spam, theme.Spam)
+	}
+	if cfg.Dim != "" {
+		theme.Dim = ansiStyle(cfg.Dim, theme.Dim)
+	}
+	if cfg.Link != "" {
+		theme.Link = ansiStyle(cfg.Link, theme.Link)
+	}
+	return theme
+}
+
+func DefaultKeys() Keys {
+	return Keys{
+		Quit:         "q",
+		ForceQuit:    "Q",
+		Sync:         "s",
+		Compose:      "c",
+		Filter:       "f",
+		Actions:      "space",
+		Open:         "enter",
+		Next:         "j",
+		Prev:         "k",
+		Down:         "down",
+		Up:           "up",
+		PageDown:     "pagedown",
+		PageUp:       "pageup",
+		Top:          "g",
+		Bottom:       "G",
+		CycleAccount: "a",
+	}
+}
+
+func KeysFromConfig(cfg config.KeysConfig) Keys {
+	keys := DefaultKeys()
+	if cfg.Quit != "" {
+		keys.Quit = normalizeKeyName(cfg.Quit)
+	}
+	if cfg.ForceQuit != "" {
+		keys.ForceQuit = normalizeKeyName(cfg.ForceQuit)
+	}
+	if cfg.Sync != "" {
+		keys.Sync = normalizeKeyName(cfg.Sync)
+	}
+	if cfg.Compose != "" {
+		keys.Compose = normalizeKeyName(cfg.Compose)
+	}
+	if cfg.Filter != "" {
+		keys.Filter = normalizeKeyName(cfg.Filter)
+	}
+	if cfg.Actions != "" {
+		keys.Actions = normalizeKeyName(cfg.Actions)
+	}
+	if cfg.Open != "" {
+		keys.Open = normalizeKeyName(cfg.Open)
+	}
+	if cfg.Next != "" {
+		keys.Next = normalizeKeyName(cfg.Next)
+	}
+	if cfg.Prev != "" {
+		keys.Prev = normalizeKeyName(cfg.Prev)
+	}
+	if cfg.Down != "" {
+		keys.Down = normalizeKeyName(cfg.Down)
+	}
+	if cfg.Up != "" {
+		keys.Up = normalizeKeyName(cfg.Up)
+	}
+	if cfg.PageDown != "" {
+		keys.PageDown = normalizeKeyName(cfg.PageDown)
+	}
+	if cfg.PageUp != "" {
+		keys.PageUp = normalizeKeyName(cfg.PageUp)
+	}
+	if cfg.Top != "" {
+		keys.Top = normalizeKeyName(cfg.Top)
+	}
+	if cfg.Bottom != "" {
+		keys.Bottom = normalizeKeyName(cfg.Bottom)
+	}
+	if cfg.CycleAccount != "" {
+		keys.CycleAccount = normalizeKeyName(cfg.CycleAccount)
+	}
+	return keys
+}
+
+func applyTheme(theme Theme) {
+	defaults := DefaultTheme()
+	if theme.Header == "" {
+		theme.Header = defaults.Header
+	}
+	if theme.Label == "" {
+		theme.Label = defaults.Label
+	}
+	if theme.Selected == "" {
+		theme.Selected = defaults.Selected
+	}
+	if theme.Unread == "" {
+		theme.Unread = defaults.Unread
+	}
+	if theme.Status == "" {
+		theme.Status = defaults.Status
+	}
+	if theme.Error == "" {
+		theme.Error = defaults.Error
+	}
+	if theme.Divider == "" {
+		theme.Divider = defaults.Divider
+	}
+	if theme.Tag == "" {
+		theme.Tag = defaults.Tag
+	}
+	if theme.Spam == "" {
+		theme.Spam = defaults.Spam
+	}
+	if theme.Dim == "" {
+		theme.Dim = defaults.Dim
+	}
+	if theme.Link == "" {
+		theme.Link = defaults.Link
+	}
+	styleHeader = theme.Header
+	styleLabel = theme.Label
+	styleSelected = theme.Selected
+	styleUnread = theme.Unread
+	styleStatus = theme.Status
+	styleError = theme.Error
+	styleDivider = theme.Divider
+	styleTag = theme.Tag
+	styleSpam = theme.Spam
+	styleDim = theme.Dim
+	styleLink = theme.Link
+}
+
+func ansiStyle(spec, fallback string) string {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return fallback
+	}
+	if strings.Contains(spec, "\x1b[") {
+		return spec
+	}
+	codes := []string{}
+	for _, token := range strings.FieldsFunc(strings.ToLower(spec), func(r rune) bool {
+		return r == ' ' || r == ',' || r == '+' || r == '|'
+	}) {
+		if code := colorCode(token); code != "" {
+			codes = append(codes, code)
+			continue
+		}
+		switch token {
+		case "none", "normal", "reset", "default":
+			return ""
+		case "bold":
+			codes = append(codes, "1")
+		case "dim":
+			codes = append(codes, "2")
+		case "italic":
+			codes = append(codes, "3")
+		case "underline", "under":
+			codes = append(codes, "4")
+		case "reverse", "inverse":
+			codes = append(codes, "7")
+		case "black":
+			codes = append(codes, "30")
+		case "red":
+			codes = append(codes, "31")
+		case "green":
+			codes = append(codes, "32")
+		case "yellow":
+			codes = append(codes, "33")
+		case "blue":
+			codes = append(codes, "34")
+		case "magenta":
+			codes = append(codes, "35")
+		case "cyan":
+			codes = append(codes, "36")
+		case "white":
+			codes = append(codes, "37")
+		case "bright-black", "gray", "grey":
+			codes = append(codes, "90")
+		case "bright-red":
+			codes = append(codes, "91")
+		case "bright-green":
+			codes = append(codes, "92")
+		case "bright-yellow":
+			codes = append(codes, "93")
+		case "bright-blue":
+			codes = append(codes, "94")
+		case "bright-magenta":
+			codes = append(codes, "95")
+		case "bright-cyan":
+			codes = append(codes, "96")
+		case "bright-white":
+			codes = append(codes, "97")
+		}
+	}
+	if len(codes) == 0 {
+		return fallback
+	}
+	return ansiCodes(codes...)
+}
+
+func ansiCodes(codes ...string) string {
+	out := []string{}
+	for _, code := range codes {
+		if code != "" {
+			out = append(out, code)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return "\x1b[" + strings.Join(out, ";") + "m"
+}
+
+func colorCode(token string) string {
+	key, value, ok := strings.Cut(token, "=")
+	if !ok {
+		key, value, ok = strings.Cut(token, ":")
+	}
+	if !ok {
+		value = token
+		key = "fg"
+	}
+	value = strings.TrimPrefix(value, "#")
+	if len(value) != 6 || strings.Trim(value, "0123456789abcdef") != "" {
+		return ""
+	}
+	switch key {
+	case "fg", "foreground":
+		return rgbFG(value)
+	case "bg", "background":
+		return rgbBG(value)
+	default:
+		return ""
+	}
+}
+
+func rgbFG(hex string) string { return rgbCode("38", hex) }
+
+func rgbBG(hex string) string { return rgbCode("48", hex) }
+
+func rgbCode(prefix, hex string) string {
+	if len(hex) != 6 {
+		return ""
+	}
+	r, errR := strconv.ParseUint(hex[0:2], 16, 8)
+	g, errG := strconv.ParseUint(hex[2:4], 16, 8)
+	b, errB := strconv.ParseUint(hex[4:6], 16, 8)
+	if errR != nil || errG != nil || errB != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s;2;%d;%d;%d", prefix, r, g, b)
+}
+
+func normalizeKeyName(value string) string {
+	value = strings.TrimSpace(value)
+	if len([]rune(value)) == 1 {
+		return value
+	}
+	return strings.ToLower(value)
+}
+
+func Run(s *store.Store, accounts *store.AccountStore, options Options) error {
+	applyTheme(options.Theme)
+	keys := options.Keys
+	if keys.Quit == "" {
+		keys = DefaultKeys()
+	}
+	pageSize := options.PageSize
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	app := &App{
+		store:       s,
+		accounts:    accounts,
+		events:      make(chan event, 16),
+		dirty:       true,
+		running:     true,
+		pgpDefaults: options.PGPDefaults,
+		pgpIdentity: strings.TrimSpace(options.PGPIdentity),
+		keys:        keys,
+		editor:      options.Editor,
+		split:       strings.ToLower(strings.TrimSpace(options.Split)),
+		pageSize:    pageSize,
+	}
 	app.reloadAccounts()
 	app.reload()
 	app.sync()
@@ -120,7 +501,7 @@ func (a *App) run() error {
 		_ = cookedMode()
 		disableMouse()
 		a.stopSyncTimer()
-		fmt.Print("\x1b[?25h\x1b[?1049l")
+		fmt.Print("\x1b[?25h\x1b[?1049l\x1b[2J\x1b[H")
 		_ = a.store.Flush()
 	}()
 	fmt.Print("\x1b[?1049h\x1b[?25l")
@@ -267,8 +648,8 @@ func (a *App) handle(key string) bool {
 		a.handleLinkAction(key)
 		return true
 	}
-	switch key {
-	case "q":
+	switch {
+	case a.keyIs(key, a.keys.Quit):
 		if a.preview != nil || a.filter != "" {
 			a.preview = nil
 			a.filter = ""
@@ -278,39 +659,39 @@ func (a *App) handle(key string) bool {
 			return true
 		}
 		a.running = false
-	case "Q":
+	case a.keyIs(key, a.keys.ForceQuit):
 		a.running = false
-	case "j", "down":
+	case a.keyIs(key, a.keys.Next, a.keys.Down):
 		a.move(1)
-	case "k", "up":
+	case a.keyIs(key, a.keys.Prev, a.keys.Up):
 		a.move(-1)
-	case "pagedown":
+	case a.keyIs(key, a.keys.PageDown):
 		a.page(1)
-	case "pageup":
+	case a.keyIs(key, a.keys.PageUp):
 		a.page(-1)
-	case "g":
+	case a.keyIs(key, a.keys.Top):
 		a.selected = 0
-	case "G":
+	case a.keyIs(key, a.keys.Bottom):
 		if len(a.messages) > 0 {
 			a.selected = len(a.messages) - 1
 		}
-	case "enter":
+	case a.keyIs(key, a.keys.Open):
 		a.openSelected()
-	case "space":
+	case a.keyIs(key, a.keys.Actions):
 		if a.current() != nil {
 			a.actionScope = "mail"
 			a.status = ""
 		}
-	case "f":
+	case a.keyIs(key, a.keys.Filter):
 		a.actionScope = "filter"
 		a.status = ""
-	case "/":
+	case key == "/":
 		a.searchPrompt()
-	case "s":
+	case a.keyIs(key, a.keys.Sync):
 		a.sync()
-	case "c":
+	case a.keyIs(key, a.keys.Compose):
 		a.compose(nil, false, false)
-	case "a":
+	case a.keyIs(key, a.keys.CycleAccount):
 		if len(a.accountsList) > 0 {
 			a.account = (a.account + 1) % (len(a.accountsList) + 1)
 			a.selected = 0
@@ -320,6 +701,15 @@ func (a *App) handle(key string) bool {
 		return false
 	}
 	return true
+}
+
+func (a *App) keyIs(key string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if candidate != "" && key == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) handleMailAction(key string) {
@@ -716,6 +1106,8 @@ func (a *App) openSelected() {
 	if msg == nil {
 		return
 	}
+	a.status = ""
+	a.error = false
 	if !msg.IsDraft() {
 		msg.SetRead(true)
 	}
@@ -726,7 +1118,7 @@ func (a *App) openSelected() {
 	}
 	a.preview = msg
 	a.previewHead = body.Headers
-	text, status, _ := pgp.ProcessText(body.Text)
+	text, status, _ := pgp.ProcessTextWithKeys(body.Text, a.publicKeyAttachments(msg))
 	a.previewBody = text
 	a.headerMode = false
 	a.bodyScroll = 0
@@ -767,9 +1159,9 @@ func (a *App) sync() {
 			var err error
 			switch account.Protocol {
 			case "imap", "imaps":
-				count, err = protocol.SyncIMAPS(account, a.store, 100, progress)
+				count, err = protocol.SyncIMAPS(account, a.store, a.pageSize, progress)
 			case "jmap":
-				count, err = protocol.SyncJMAP(account, a.store, 100, progress)
+				count, err = protocol.SyncJMAP(account, a.store, a.pageSize, progress)
 			}
 			if err != nil {
 				a.events <- event{status: err.Error(), error: true}
@@ -811,7 +1203,7 @@ func (a *App) compose(source *store.Message, replyAll bool, forward bool) {
 		a.statusError("no account")
 		return
 	}
-	draft := protocol.Draft{From: account.Email}
+	draft := protocol.Draft{From: account.Email, PGP: a.pgpDefaults}
 	if source != nil {
 		sourceText := a.previewBody
 		if a.preview == nil || a.preview.Key != source.Key || sourceText == "" {
@@ -820,7 +1212,7 @@ func (a *App) compose(source *store.Message, replyAll bool, forward bool) {
 				a.statusError(err.Error())
 				return
 			}
-			sourceText, _, _ = pgp.ProcessText(body.Text)
+			sourceText, _, _ = pgp.ProcessTextWithKeys(body.Text, a.publicKeyAttachments(source))
 		}
 		if forward {
 			draft.Subject = prefixedSubject("Fwd:", source.Subject)
@@ -851,7 +1243,10 @@ func (a *App) compose(source *store.Message, replyAll bool, forward bool) {
 		if strings.TrimSpace(parsed.From) == "" {
 			parsed.From = draft.From
 		}
-		parsed.PGP = draft.PGP
+		parsed.Attachments = draft.Attachments
+		if strings.TrimSpace(parsed.PGP) == "" {
+			parsed.PGP = draft.PGP
+		}
 		sendAccount, err := a.sendAccountForDraft(account, &parsed)
 		if err != nil {
 			a.statusError(err.Error())
@@ -890,7 +1285,7 @@ func (a *App) sendDraft(account store.Account, parsed protocol.Draft) {
 	go func(account store.Account, parsed protocol.Draft) {
 		defer a.reportPanic()
 		pgpStatus := ""
-		parsed, pgpStatus, err := pgp.ApplyDraft(draftSenderEmail(parsed.From), parsed)
+		parsed, pgpStatus, err := pgp.ApplyDraft(a.draftPGPIdentity(parsed), parsed)
 		if err != nil {
 			a.events <- event{status: err.Error(), error: true}
 			return
@@ -1021,6 +1416,27 @@ func (a *App) importAttachmentKey(att store.Attachment) {
 	a.status = "imported public key"
 }
 
+func (a *App) publicKeyAttachments(msg *store.Message) [][]byte {
+	if msg == nil || !msg.HasAttachment {
+		return nil
+	}
+	attachments, err := a.store.Attachments(msg)
+	if err != nil {
+		return nil
+	}
+	return publicKeyAttachmentData(attachments)
+}
+
+func publicKeyAttachmentData(attachments []store.Attachment) [][]byte {
+	keys := [][]byte{}
+	for _, attachment := range attachments {
+		if pgp.IsPublicKeyAttachment(attachment.Filename, attachment.ContentType, attachment.Data) {
+			keys = append(keys, attachment.Data)
+		}
+	}
+	return keys
+}
+
 func (a *App) saveAttachment(att store.Attachment) {
 	defaultPath := filepath.Join(userdirs.Downloads(), safeName(att.Filename))
 	target, cancelled, err := a.promptPath("save as", defaultPath)
@@ -1065,14 +1481,23 @@ func (a *App) reportPanic() {
 func (a *App) confirmCompose(account store.Account, draft *protocol.Draft) string {
 	scroll := 0
 	pgpMenu := false
-	availability := pgp.CheckAvailability(draftSenderEmail(draft.From), *draft)
+	notice := ""
+	availability := pgp.CheckAvailability(a.draftPGPIdentity(*draft), *draft)
 	restrictPGP(draft, availability)
 	for {
 		w, h := terminalSize()
 		fmt.Print("\x1b[2J")
 		printStyledLine(0, 0, w, " murat | compose preview ", styleHeader)
-		printStyledLine(h-2, 0, w, composePGPLine(*draft, availability, pgpMenu), styleStatus)
-		printStyledLine(h-1, 0, w, composeShortcuts(availability, pgpMenu), styleHeader)
+		statusLine := composePGPLine(*draft, availability, pgpMenu)
+		statusStyle := styleStatus
+		if notice != "" && !pgpMenu {
+			statusLine = notice
+			if strings.HasPrefix(notice, "ERROR:") {
+				statusStyle = styleError
+			}
+		}
+		printStyledLine(h-2, 0, w, statusLine, statusStyle)
+		printStyledLine(h-1, 0, w, composeShortcuts(*draft, availability, pgpMenu), styleHeader)
 		lines := strings.Split(formatDraftPreview(*draft), "\n")
 		bodyHeight := max(0, h-3)
 		if scroll > max(0, len(lines)-bodyHeight) {
@@ -1094,31 +1519,110 @@ func (a *App) confirmCompose(account store.Account, draft *protocol.Draft) strin
 		}
 		switch key {
 		case "s", "enter":
+			if len(draft.Attachments) > 0 && pgpBodyProtectionEnabled(draft.PGP) {
+				notice = "ERROR: PGP encrypt/sign with file attachments not supported"
+				continue
+			}
 			a.dirty = true
 			return "send"
 		case "d":
+			if len(draft.Attachments) > 0 {
+				notice = "ERROR: attached files cannot be saved in local drafts"
+				continue
+			}
 			a.dirty = true
 			return "draft"
 		case "e":
 			a.dirty = true
 			return "edit"
+		case "a":
+			notice = a.attachDraftFile(draft)
+			scroll = min(scroll, max(0, len(strings.Split(formatDraftPreview(*draft), "\n"))-bodyHeight))
+		case "A":
+			notice = detachLastDraftAttachment(draft)
+			scroll = min(scroll, max(0, len(strings.Split(formatDraftPreview(*draft), "\n"))-bodyHeight))
 		case "x", "q", "esc":
 			a.dirty = true
 			return "cancel"
 		case "g":
+			notice = ""
 			if anyPGPAvailable(availability) {
 				pgpMenu = true
 			}
 		case "j", "down":
+			notice = ""
 			scroll = min(max(0, len(lines)-bodyHeight), scroll+1)
 		case "k", "up":
+			notice = ""
 			scroll = max(0, scroll-1)
 		case "pagedown":
+			notice = ""
 			scroll = min(max(0, len(lines)-bodyHeight), scroll+bodyHeight)
 		case "pageup":
+			notice = ""
 			scroll = max(0, scroll-bodyHeight)
 		}
 	}
+}
+
+func (a *App) draftPGPIdentity(draft protocol.Draft) string {
+	from := draftSenderEmail(draft.From)
+	if strings.TrimSpace(a.pgpIdentity) != "" && (from == "" || !pgp.HasSecretKey(from)) {
+		return strings.TrimSpace(a.pgpIdentity)
+	}
+	return from
+}
+
+func (a *App) attachDraftFile(draft *protocol.Draft) string {
+	path, cancelled, err := a.promptFile("attach file", userdirs.Downloads())
+	if err != nil {
+		return "ERROR: " + err.Error()
+	}
+	if cancelled || strings.TrimSpace(path) == "" {
+		return ""
+	}
+	attachment, err := draftAttachmentFromPath(path)
+	if err != nil {
+		return "ERROR: " + err.Error()
+	}
+	draft.Attachments = append(draft.Attachments, attachment)
+	return "attached " + attachment.Filename
+}
+
+func detachLastDraftAttachment(draft *protocol.Draft) string {
+	if len(draft.Attachments) == 0 {
+		return "no attachments"
+	}
+	last := draft.Attachments[len(draft.Attachments)-1]
+	draft.Attachments = draft.Attachments[:len(draft.Attachments)-1]
+	name := strings.TrimSpace(last.Filename)
+	if name == "" {
+		name = "attachment"
+	}
+	return "detached " + name
+}
+
+func draftAttachmentFromPath(path string) (protocol.Attachment, error) {
+	path = userdirs.Expand(strings.TrimSpace(path))
+	if path == "" {
+		return protocol.Attachment{}, fmt.Errorf("attachment path required")
+	}
+	stat, err := os.Stat(path)
+	if err != nil {
+		return protocol.Attachment{}, err
+	}
+	if stat.IsDir() {
+		return protocol.Attachment{}, fmt.Errorf("choose a file, not a directory")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return protocol.Attachment{}, err
+	}
+	contentType := mime.TypeByExtension(filepath.Ext(path))
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/octet-stream"
+	}
+	return protocol.Attachment{Filename: filepath.Base(path), ContentType: contentType, Data: data}, nil
 }
 
 func (a *App) defaultSendAccount() (store.Account, bool) {
@@ -1246,6 +1750,20 @@ func (a *App) draw() {
 		a.drawList(1, 0, h-3, w)
 		return
 	}
+	if a.split == "horizontal" {
+		left := max(24, w/3)
+		if left > w-20 {
+			left = max(10, w/2)
+		}
+		a.listArea = area{y: 1, x: 0, h: h - 3, w: left}
+		a.bodyArea = area{y: 1, x: left + 1, h: h - 3, w: w - left - 1}
+		a.drawList(a.listArea.y, a.listArea.x, a.listArea.h, a.listArea.w)
+		for row := 1; row < h-2; row++ {
+			printSegment(row, left, 1, "|", styleDivider)
+		}
+		a.drawPreview(a.bodyArea.y, a.bodyArea.x, a.bodyArea.h, a.bodyArea.w)
+		return
+	}
 	top := (h - 3) / 3
 	if top < 3 {
 		top = 3
@@ -1262,7 +1780,7 @@ func (a *App) drawList(y, x, height, width int) {
 		return
 	}
 	if len(a.messages) == 0 {
-		printLine(y, x, width, "no mail; press s to sync")
+		printLine(y, x, width, "no mail; press "+a.keys.Sync+" to sync")
 		return
 	}
 	if a.selected < a.scroll {
@@ -1383,7 +1901,7 @@ func printPreviewLine(y, x, width int, line previewLine) {
 	if line.label != "" {
 		labelWidth := 9
 		printLine(y, x, width, "")
-		printSegment(y, x, min(labelWidth, width), line.label+":", styleHeader)
+		printSegment(y, x, min(labelWidth, width), line.label+":", styleLabel)
 		if width > labelWidth {
 			style := ""
 			if line.label == "Tags" {
@@ -1426,11 +1944,19 @@ func (a *App) shortcuts() string {
 	if a.actionScope == "link" {
 		return "link: enter open  c copy  esc cancel"
 	}
-	parts := []string{"j/k move", "enter open", "SPC actions", "f filters", "/ search", "s sync", "c compose"}
-	if len(a.accountsList) > 1 {
-		parts = append(parts, "a acct")
+	parts := []string{
+		a.keys.Next + "/" + a.keys.Prev + " move",
+		a.keys.Open + " open",
+		a.keys.Actions + " actions",
+		a.keys.Filter + " filters",
+		"/ search",
+		a.keys.Sync + " sync",
+		a.keys.Compose + " compose",
 	}
-	parts = append(parts, "q quit")
+	if len(a.accountsList) > 1 {
+		parts = append(parts, a.keys.CycleAccount+" acct")
+	}
+	parts = append(parts, a.keys.Quit+" quit")
 	return strings.Join(parts, "  ")
 }
 
@@ -1747,7 +2273,7 @@ func richStyle(bold, italic, under bool) string {
 
 func (a *App) runEditor(path string) error {
 	_ = cookedMode()
-	err := compose.RunEditor(path)
+	err := compose.RunEditorWith(path, a.editor)
 	_ = rawMode()
 	fmt.Print("\x1b[?1049h\x1b[?25l")
 	enableMouse()
@@ -1762,6 +2288,12 @@ func (a *App) promptLine(label string) (string, error) {
 func (a *App) promptPath(label, defaultValue string) (string, bool, error) {
 	return a.promptInput(label+" ["+defaultValue+"]: ", func(value string) string {
 		return completeDirectoryPath(value, filepath.Dir(defaultValue))
+	})
+}
+
+func (a *App) promptFile(label, fallbackDir string) (string, bool, error) {
+	return a.promptInput(label+": ", func(value string) string {
+		return completeFilePath(value, fallbackDir)
 	})
 }
 
@@ -1806,6 +2338,14 @@ func (a *App) promptInput(prompt string, complete func(string) string) (string, 
 }
 
 func completeDirectoryPath(input, fallbackDir string) string {
+	return completePath(input, fallbackDir, false)
+}
+
+func completeFilePath(input, fallbackDir string) string {
+	return completePath(input, fallbackDir, true)
+}
+
+func completePath(input, fallbackDir string, includeFiles bool) string {
 	if input == "" {
 		return withTrailingSeparator(fallbackDir)
 	}
@@ -1818,21 +2358,36 @@ func completeDirectoryPath(input, fallbackDir string) string {
 	if err != nil {
 		return input
 	}
-	matches := []string{}
+	type match struct {
+		name  string
+		isDir bool
+	}
+	matches := []match{}
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+		if !entry.IsDir() && !includeFiles {
 			continue
 		}
-		matches = append(matches, entry.Name())
+		if !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		matches = append(matches, match{name: entry.Name(), isDir: entry.IsDir()})
 	}
 	if len(matches) == 0 {
 		return input
 	}
-	sort.Strings(matches)
+	sort.Slice(matches, func(i, j int) bool { return matches[i].name < matches[j].name })
 	if len(matches) == 1 {
-		return withTrailingSeparator(dirPart + matches[0])
+		path := dirPart + matches[0].name
+		if matches[0].isDir {
+			return withTrailingSeparator(path)
+		}
+		return path
 	}
-	common := commonPrefix(matches)
+	names := make([]string, 0, len(matches))
+	for _, match := range matches {
+		names = append(names, match.name)
+	}
+	common := commonPrefix(names)
 	if len(common) > len(prefix) {
 		return dirPart + common
 	}
@@ -1893,7 +2448,32 @@ func prefixedSubject(prefix, subject string) string {
 }
 
 func formatDraftPreview(draft protocol.Draft) string {
-	return "From: " + draft.From + "\nTo: " + draft.To + "\nCc: " + draft.Cc + "\nBcc: " + draft.Bcc + "\nSubject: " + draft.Subject + "\n\n" + draft.Body
+	lines := []string{
+		"From: " + draft.From,
+		"To: " + draft.To,
+		"Cc: " + draft.Cc,
+		"Bcc: " + draft.Bcc,
+		"Subject: " + draft.Subject,
+	}
+	if len(draft.Attachments) > 0 {
+		lines = append(lines, "Attachments:")
+		for _, attachment := range draft.Attachments {
+			lines = append(lines, "  - "+draftAttachmentSummary(attachment))
+		}
+	}
+	return strings.Join(lines, "\n") + "\n\n" + draft.Body
+}
+
+func draftAttachmentSummary(attachment protocol.Attachment) string {
+	name := strings.TrimSpace(attachment.Filename)
+	if name == "" {
+		name = "attachment"
+	}
+	contentType := strings.TrimSpace(attachment.ContentType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	return fmt.Sprintf("%s (%s, %dB)", name, contentType, len(attachment.Data))
 }
 
 func composePGPLine(draft protocol.Draft, availability pgp.Availability, menu bool) string {
@@ -1938,7 +2518,7 @@ func composePGPMenuLine(draft protocol.Draft, availability pgp.Availability) str
 	return "PGP menu: " + strings.Join(parts, "  ")
 }
 
-func composeShortcuts(availability pgp.Availability, menu bool) string {
+func composeShortcuts(draft protocol.Draft, availability pgp.Availability, menu bool) string {
 	if menu {
 		parts := []string{"pgp:"}
 		if availability.Sign {
@@ -1956,7 +2536,10 @@ func composeShortcuts(availability pgp.Availability, menu bool) string {
 		parts = append(parts, "esc back")
 		return strings.Join(parts, "  ")
 	}
-	parts := []string{"enter/s send", "e edit", "d draft"}
+	parts := []string{"enter/s send", "e edit", "a attach", "d draft"}
+	if len(draft.Attachments) > 0 {
+		parts = append(parts, "A detach")
+	}
 	if anyPGPAvailable(availability) {
 		parts = append(parts, "g pgp")
 	}
@@ -2049,6 +2632,13 @@ func pgpSet(value string) map[string]bool {
 		}
 	}
 	return out
+}
+
+func pgpBodyProtectionEnabled(value string) bool {
+	options := pgpSet(value)
+	return options["encrypt"] || options["encrypted"] ||
+		options["sign"] || options["signed"] ||
+		options["self-encrypt"] || options["selfencrypt"] || options["self"]
 }
 
 func yesNo(value bool) string {

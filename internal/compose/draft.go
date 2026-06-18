@@ -11,12 +11,16 @@ import (
 )
 
 func Edit(draft protocol.Draft) (protocol.Draft, error) {
+	return EditWithEditor(draft, "")
+}
+
+func EditWithEditor(draft protocol.Draft, editor string) (protocol.Draft, error) {
 	path, err := WriteDraftFile(draft)
 	if err != nil {
 		return protocol.Draft{}, err
 	}
 	defer os.Remove(path)
-	if err := RunEditor(path); err != nil {
+	if err := RunEditorWith(path, editor); err != nil {
 		return protocol.Draft{}, err
 	}
 	return ReadDraftFile(path)
@@ -28,6 +32,10 @@ func WriteDraftFile(draft protocol.Draft) (string, error) {
 		return "", err
 	}
 	defer file.Close()
+	if strings.TrimSpace(draft.PGP) != "" {
+		_, err = fmt.Fprintf(file, "From: %s\nTo: %s\nCc: %s\nBcc: %s\nSubject: %s\nPGP: %s\n\n%s", draft.From, draft.To, draft.Cc, draft.Bcc, draft.Subject, draft.PGP, draft.Body)
+		return file.Name(), err
+	}
 	_, err = fmt.Fprintf(file, "From: %s\nTo: %s\nCc: %s\nBcc: %s\nSubject: %s\n\n%s", draft.From, draft.To, draft.Cc, draft.Bcc, draft.Subject, draft.Body)
 	return file.Name(), err
 }
@@ -71,7 +79,14 @@ func ReadDraftFile(path string) (protocol.Draft, error) {
 }
 
 func RunEditor(path string) error {
-	editor := os.Getenv("VISUAL")
+	return RunEditorWith(path, "")
+}
+
+func RunEditorWith(path, editor string) error {
+	editor = strings.TrimSpace(editor)
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
 	if editor == "" {
 		editor = os.Getenv("EDITOR")
 	}

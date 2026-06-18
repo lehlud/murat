@@ -9,7 +9,7 @@ import (
 )
 
 func TestDraftFromRoundTrip(t *testing.T) {
-	path, err := WriteDraftFile(protocol.Draft{From: "Alice <alice@example.com>", To: "bob@example.com", Subject: "hello", Body: "body"})
+	path, err := WriteDraftFile(protocol.Draft{From: "Alice <alice@example.com>", To: "bob@example.com", Subject: "hello", Body: "body", PGP: "sign"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,6 +20,9 @@ func TestDraftFromRoundTrip(t *testing.T) {
 	}
 	if draft.From != "Alice <alice@example.com>" {
 		t.Fatalf("from = %q", draft.From)
+	}
+	if draft.PGP != "sign" {
+		t.Fatalf("pgp = %q", draft.PGP)
 	}
 }
 

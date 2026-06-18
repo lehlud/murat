@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -39,6 +41,17 @@ func TestToggleSelfEncryptEnablesEncrypt(t *testing.T) {
 	}
 }
 
+func TestPGPBodyProtectionEnabled(t *testing.T) {
+	for _, value := range []string{"encrypt", "sign", "self-encrypt"} {
+		if !pgpBodyProtectionEnabled(value) {
+			t.Fatalf("pgpBodyProtectionEnabled(%q) = false", value)
+		}
+	}
+	if pgpBodyProtectionEnabled("attach-pubkey") {
+		t.Fatal("attach-pubkey should not count as body protection")
+	}
+}
+
 func TestMarkdownLinks(t *testing.T) {
 	links := markdownLinks("Read [the docs](https://example.com) now")
 	if len(links) != 1 {
@@ -46,5 +59,42 @@ func TestMarkdownLinks(t *testing.T) {
 	}
 	if links[0].start != 5 || links[0].end != 36 || links[0].url != "https://example.com" {
 		t.Fatalf("link = %#v", links[0])
+	}
+}
+
+func TestFormatDraftPreviewShowsAttachments(t *testing.T) {
+	preview := formatDraftPreview(protocol.Draft{
+		From:    "alice@example.com",
+		To:      "bob@example.com",
+		Subject: "hi",
+		Body:    "body",
+		Attachments: []protocol.Attachment{{
+			Filename:    "notes.txt",
+			ContentType: "text/plain",
+			Data:        []byte("hello"),
+		}},
+	})
+	for _, want := range []string{"Attachments:", "  - notes.txt (text/plain, 5B)", "\n\nbody"} {
+		if !strings.Contains(preview, want) {
+			t.Fatalf("preview missing %q:\n%s", want, preview)
+		}
+	}
+}
+
+func TestDraftAttachmentFromPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attachment, err := draftAttachmentFromPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.Filename != "notes.txt" || string(attachment.Data) != "hello" {
+		t.Fatalf("attachment = %#v", attachment)
+	}
+	if !strings.HasPrefix(attachment.ContentType, "text/plain") {
+		t.Fatalf("content type = %q", attachment.ContentType)
 	}
 }
