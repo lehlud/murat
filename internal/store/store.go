@@ -601,7 +601,11 @@ func (s *Store) OpenBody(msg *Message) (*Body, error) {
 	if err != nil {
 		return nil, err
 	}
+	changed := msg.HasAttachment != hasAttachment
 	msg.HasAttachment = hasAttachment
+	if changed {
+		s.MarkDirty()
+	}
 	body := Body{Headers: headerText(raw), Text: text, RawSize: len(raw), FetchedAt: time.Now().UTC().Format(time.RFC3339)}
 	return &body, nil
 }
@@ -1472,7 +1476,7 @@ func extractMultipart(reader *multipart.Reader) (string, string, bool, error) {
 		contentType := part.Header.Get("Content-Type")
 		mediaType, params, _ := mime.ParseMediaType(contentType)
 		disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
-		if strings.EqualFold(disposition, "attachment") || part.FileName() != "" {
+		if attachmentPart(mail.Header(part.Header), disposition, mediaType, partFilename(part, params)) {
 			hasAttachment = true
 			continue
 		}
@@ -1527,13 +1531,16 @@ func extractAttachments(header mail.Header, body io.Reader, out *[]Attachment) e
 			if err != nil {
 				return err
 			}
-			partType, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+			partType, typeParams, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
 			disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
-			filename := part.FileName()
-			if strings.EqualFold(disposition, "attachment") || filename != "" {
+			filename := partFilename(part, typeParams)
+			if attachmentPart(mail.Header(part.Header), disposition, partType, filename) {
 				data, err := readDecoded(part, part.Header.Get("Content-Transfer-Encoding"))
 				if err != nil {
 					return err
+				}
+				if strings.TrimSpace(filename) == "" {
+					filename = inlineAttachmentName(mail.Header(part.Header), partType, len(*out)+1)
 				}
 				*out = append(*out, Attachment{Filename: filename, ContentType: partType, Size: len(data), Data: data})
 				continue
@@ -1546,6 +1553,45 @@ func extractAttachments(header mail.Header, body io.Reader, out *[]Attachment) e
 		}
 	}
 	return nil
+}
+
+func partFilename(part *multipart.Part, typeParams map[string]string) string {
+	if filename := strings.TrimSpace(part.FileName()); filename != "" {
+		return filename
+	}
+	return strings.TrimSpace(typeParams["name"])
+}
+
+func attachmentPart(header mail.Header, disposition, mediaType, filename string) bool {
+	if strings.EqualFold(disposition, "attachment") || strings.TrimSpace(filename) != "" {
+		return true
+	}
+	if !inlineImagePart(mediaType) {
+		return false
+	}
+	return strings.EqualFold(disposition, "inline") || strings.TrimSpace(header.Get("Content-ID")) != "" || strings.TrimSpace(header.Get("X-Attachment-Id")) != ""
+}
+
+func inlineImagePart(mediaType string) bool {
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	return strings.HasPrefix(mediaType, "image/")
+}
+
+func inlineAttachmentName(header mail.Header, mediaType string, index int) string {
+	name := strings.Trim(strings.TrimSpace(header.Get("Content-ID")), "<>")
+	if name == "" {
+		name = strings.TrimSpace(header.Get("X-Attachment-Id"))
+	}
+	name = safeAttachmentName(name)
+	if name == "attachment" {
+		name = fmt.Sprintf("inline-%d", index)
+	}
+	if filepath.Ext(name) == "" {
+		if exts, _ := mime.ExtensionsByType(mediaType); len(exts) > 0 {
+			name += exts[0]
+		}
+	}
+	return name
 }
 
 func readDecoded(reader io.Reader, encoding string) ([]byte, error) {

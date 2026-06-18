@@ -136,6 +136,7 @@ type App struct {
 	split        string
 	pageSize     int
 	pgpIdentity  string
+	openedDirs   []string
 	running      bool
 }
 
@@ -501,6 +502,7 @@ func (a *App) run() error {
 		_ = cookedMode()
 		disableMouse()
 		a.stopSyncTimer()
+		a.cleanupOpenedAttachments()
 		fmt.Print("\x1b[?25h\x1b[?1049l\x1b[2J\x1b[H")
 		_ = a.store.Flush()
 	}()
@@ -1384,18 +1386,39 @@ func (a *App) viewAttachment(msg *store.Message, att store.Attachment) {
 }
 
 func (a *App) openAttachment(att store.Attachment) {
-	dir, err := os.MkdirTemp("", "murat-attachment.*")
+	dir, err := a.openAttachmentDir()
 	if err != nil {
 		a.statusError(err.Error())
 		return
 	}
 	path := filepath.Join(dir, safeName(att.Filename))
 	if err := os.WriteFile(path, att.Data, 0o600); err != nil {
+		_ = os.RemoveAll(dir)
 		a.statusError(err.Error())
 		return
 	}
-	_ = openExternal(path)
+	if err := openExternal(path); err != nil {
+		_ = os.RemoveAll(dir)
+		a.statusError(err.Error())
+		return
+	}
+	a.openedDirs = append(a.openedDirs, dir)
 	a.status = "opened " + filepath.Base(path)
+}
+
+func (a *App) openAttachmentDir() (string, error) {
+	parent := filepath.Join(userdirs.Cache(), "murat", "attachments")
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(parent, "open-*")
+}
+
+func (a *App) cleanupOpenedAttachments() {
+	for _, dir := range a.openedDirs {
+		_ = os.RemoveAll(dir)
+	}
+	a.openedDirs = nil
 }
 
 func openExternal(target string) error {

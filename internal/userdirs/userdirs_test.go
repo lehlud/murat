@@ -55,3 +55,23 @@ func TestDownloadsFallsBackToHomeDownloads(t *testing.T) {
 		t.Fatalf("Downloads() = %q, want %q", got, want)
 	}
 }
+
+func TestCacheUsesXDGCacheHome(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cache")
+	t.Setenv("XDG_CACHE_HOME", dir)
+
+	if got := Cache(); got != dir {
+		t.Fatalf("Cache() = %q, want %q", got, dir)
+	}
+}
+
+func TestCacheFallsBackToHomeCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", "")
+
+	want := filepath.Join(home, ".cache")
+	if got := Cache(); got != want {
+		t.Fatalf("Cache() = %q, want %q", got, want)
+	}
+}

@@ -22,6 +22,16 @@ func Downloads() string {
 	return filepath.Join(home, "Downloads")
 }
 
+func Cache() string {
+	if dir := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); dir != "" {
+		return Expand(dir)
+	}
+	if home := homeDir(); home != "" {
+		return filepath.Join(home, ".cache")
+	}
+	return "."
+}
+
 // Expand applies shell-like home and environment expansion for user paths.
 func Expand(path string) string {
 	if path == "~" {

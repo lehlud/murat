@@ -42,6 +42,48 @@ func TestSaveAttachments(t *testing.T) {
 	}
 }
 
+func TestInlineImageAppearsAsAttachment(t *testing.T) {
+	dir := t.TempDir()
+	paths := testPaths(dir)
+	s, err := Open(paths, bytes.Repeat([]byte{1}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: inline\r\nDate: Tue, 09 Jun 2026 10:00:00 +0000\r\nContent-Type: multipart/related; boundary=rel\r\n\r\n--rel\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>logo <img src=\"cid:logo@example\"> <img src=\"cid:photo@example\"></p>\r\n--rel\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\nContent-ID: <logo@example>\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--rel\r\nContent-Type: image/jpeg; name=photo.jpg\r\nContent-Disposition: inline\r\nContent-ID: <photo@example>\r\nContent-Transfer-Encoding: base64\r\n\r\nBAUG\r\n--rel--\r\n")
+	msg, err := s.ImportRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !msg.HasAttachment {
+		t.Fatal("expected inline image attachment marker")
+	}
+	attachments, err := s.Attachments(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attachments) != 2 {
+		t.Fatalf("expected 2 attachments, got %d", len(attachments))
+	}
+	if attachments[0].Filename != "logo@example.png" {
+		t.Fatalf("filename = %q", attachments[0].Filename)
+	}
+	if attachments[0].ContentType != "image/png" {
+		t.Fatalf("content type = %q", attachments[0].ContentType)
+	}
+	if !bytes.Equal(attachments[0].Data, []byte{1, 2, 3}) {
+		t.Fatalf("data = %#v", attachments[0].Data)
+	}
+	if attachments[1].Filename != "photo.jpg" {
+		t.Fatalf("named filename = %q", attachments[1].Filename)
+	}
+	if attachments[1].ContentType != "image/jpeg" {
+		t.Fatalf("named content type = %q", attachments[1].ContentType)
+	}
+	if !bytes.Equal(attachments[1].Data, []byte{4, 5, 6}) {
+		t.Fatalf("named data = %#v", attachments[1].Data)
+	}
+}
+
 func TestSearchIndexImportPersistRemove(t *testing.T) {
 	dir := t.TempDir()
 	paths := testPaths(dir)

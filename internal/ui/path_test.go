@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"lehnert.dev/murat/internal/userdirs"
 )
 
 func TestCompleteDirectoryPathUsesFallbackForEmptyInput(t *testing.T) {
@@ -55,5 +57,26 @@ func TestCompleteFilePathKeepsDirectorySlash(t *testing.T) {
 	want := dir + string(os.PathSeparator)
 	if got := completeFilePath(input, ""); got != want {
 		t.Fatalf("completeFilePath() = %q, want %q", got, want)
+	}
+}
+
+func TestOpenAttachmentDirUsesCache(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "cache")
+	t.Setenv("XDG_CACHE_HOME", cache)
+	app := &App{}
+	dir, err := app.openAttachmentDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := filepath.Dir(dir), filepath.Join(userdirs.Cache(), "murat", "attachments"); got != want {
+		t.Fatalf("parent = %q, want %q", got, want)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.openedDirs = []string{dir}
+	app.cleanupOpenedAttachments()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("dir still exists: %v", err)
 	}
 }
