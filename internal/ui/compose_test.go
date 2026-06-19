@@ -57,8 +57,16 @@ func TestMarkdownLinks(t *testing.T) {
 	if len(links) != 1 {
 		t.Fatalf("links = %#v", links)
 	}
-	if links[0].start != 5 || links[0].end != 36 || links[0].url != "https://example.com" {
+	if links[0].start != 5 || links[0].end != 13 || links[0].url != "https://example.com" {
 		t.Fatalf("link = %#v", links[0])
+	}
+}
+
+func TestRichPlainTextShowsLinkLabelOnly(t *testing.T) {
+	got := richPlainText("Read [the docs](https://example.com) now")
+	want := "Read the docs now"
+	if got != want {
+		t.Fatalf("richPlainText() = %q, want %q", got, want)
 	}
 }
 

@@ -144,6 +144,7 @@ type event struct {
 	status           string
 	error            bool
 	reload           bool
+	accountsChanged  bool
 	clearSelectionAt int
 	autoSync         int
 	syncDone         bool
@@ -544,10 +545,14 @@ func (a *App) drainEvents() bool {
 			}
 			if event.syncDone {
 				a.syncRunning = false
+				a.reloadAccounts()
 				a.scheduleAutoSync()
 			}
 			if event.reload {
 				a.reload()
+			}
+			if event.accountsChanged {
+				a.reloadAccounts()
 			}
 			if event.clearSelectionAt != 0 && event.clearSelectionAt == a.selectToken && !a.selectActive {
 				a.clearSelection()
@@ -956,7 +961,7 @@ func (a *App) linkAtBodyPoint(x, y int) string {
 		return ""
 	}
 	col := max(0, min(max(0, a.bodyArea.w-1), x-a.bodyArea.x))
-	for _, link := range markdownLinks(previewPlainText(lines[lineIndex])) {
+	for _, link := range previewLinks(lines[lineIndex]) {
 		if col >= link.start && col <= link.end {
 			return link.url
 		}
@@ -1160,8 +1165,8 @@ func (a *App) sync() {
 			var count int
 			var err error
 			switch account.Protocol {
-			case "imap", "imaps":
-				count, err = protocol.SyncIMAPS(account, a.store, a.pageSize, progress)
+			case "imap", "imaps", "exchange-online":
+				count, err = protocol.SyncIMAPSWithUpdater(account, a.store, a.pageSize, progress, a.accounts.Upsert)
 			case "jmap":
 				count, err = protocol.SyncJMAP(account, a.store, a.pageSize, progress)
 			}
@@ -1292,10 +1297,17 @@ func (a *App) sendDraft(account store.Account, parsed protocol.Draft) {
 			a.events <- event{status: err.Error(), error: true}
 			return
 		}
+		accountsChanged := false
 		if account.Protocol == "jmap" {
 			err = protocol.SendJMAP(account, parsed)
 		} else {
-			err = protocol.SendSMTPS(account, parsed)
+			err = protocol.SendSMTPSWithUpdater(account, parsed, func(updated store.Account) error {
+				if err := a.accounts.Upsert(updated); err != nil {
+					return err
+				}
+				accountsChanged = true
+				return nil
+			})
 		}
 		if err != nil {
 			a.events <- event{status: err.Error(), error: true}
@@ -1305,9 +1317,9 @@ func (a *App) sendDraft(account store.Account, parsed protocol.Draft) {
 		a.store.RememberAddressStrings(parsed.From, parsed.To, parsed.Cc, parsed.Bcc)
 		_ = a.store.Flush()
 		if pgpStatus != "" {
-			a.events <- event{status: "sent; " + pgpStatus}
+			a.events <- event{status: "sent; " + pgpStatus, accountsChanged: accountsChanged}
 		} else {
-			a.events <- event{status: "sent"}
+			a.events <- event{status: "sent", accountsChanged: accountsChanged}
 		}
 	}(account, parsed)
 }
@@ -1957,6 +1969,13 @@ func previewPlainText(line previewLine) string {
 	return richPlainText(line.text)
 }
 
+func previewLinks(line previewLine) []markdownLink {
+	if line.blank || line.label != "" {
+		return nil
+	}
+	return markdownLinks(line.text)
+}
+
 func (a *App) shortcuts() string {
 	if a.actionScope == "mail" {
 		return "mail: r reply  R reply-all  f forward  h headers  a attach  u unread  t trash  s spam  esc back"
@@ -2153,8 +2172,8 @@ func printRichLine(y, x, width int, text string) {
 	col := 0
 	bold, italic, under := false, false, false
 	for i := 0; i < len(text) && col < width; {
-		if raw, _, ok := markdownLinkAt(text, i); ok {
-			chunk := raw
+		if raw, _, label, ok := markdownLinkAt(text, i); ok {
+			chunk := richPlainText(label)
 			if displayLen(chunk) > width-col {
 				chunk = clipRunes(chunk, width-col)
 			}
@@ -2180,7 +2199,7 @@ func printRichLine(y, x, width int, text string) {
 		}
 		start := i
 		for i < len(text) && !strings.HasPrefix(text[i:], "**") && !strings.HasPrefix(text[i:], "__") && text[i] != '*' {
-			if _, _, ok := markdownLinkAt(text, i); ok {
+			if _, _, _, ok := markdownLinkAt(text, i); ok {
 				break
 			}
 			i++
@@ -2204,43 +2223,48 @@ type markdownLink struct {
 func markdownLinks(text string) []markdownLink {
 	out := []markdownLink{}
 	for i := 0; i < len(text); {
-		raw, url, ok := markdownLinkAt(text, i)
+		raw, url, label, ok := markdownLinkAt(text, i)
 		if !ok {
 			i++
 			continue
 		}
-		start := displayLen(text[:i])
-		out = append(out, markdownLink{start: start, end: start + displayLen(raw), url: url})
+		start := displayLen(richPlainText(text[:i]))
+		out = append(out, markdownLink{start: start, end: start + displayLen(richPlainText(label)), url: url})
 		i += len(raw)
 	}
 	return out
 }
 
-func markdownLinkAt(text string, i int) (string, string, bool) {
+func markdownLinkAt(text string, i int) (string, string, string, bool) {
 	if i >= len(text) || text[i] != '[' {
-		return "", "", false
+		return "", "", "", false
 	}
 	labelEnd := strings.Index(text[i:], "](")
 	if labelEnd <= 1 {
-		return "", "", false
+		return "", "", "", false
 	}
 	labelEnd += i
 	urlStart := labelEnd + 2
 	urlEnd := strings.IndexByte(text[urlStart:], ')')
 	if urlEnd <= 0 {
-		return "", "", false
+		return "", "", "", false
 	}
 	urlEnd += urlStart
 	url := strings.TrimSpace(text[urlStart:urlEnd])
 	if url == "" || (!strings.HasPrefix(strings.ToLower(url), "http://") && !strings.HasPrefix(strings.ToLower(url), "https://") && !strings.HasPrefix(strings.ToLower(url), "mailto:")) {
-		return "", "", false
+		return "", "", "", false
 	}
-	return text[i : urlEnd+1], url, true
+	return text[i : urlEnd+1], url, text[i+1 : labelEnd], true
 }
 
 func richPlainText(text string) string {
 	var out strings.Builder
 	for i := 0; i < len(text); {
+		if raw, _, label, ok := markdownLinkAt(text, i); ok {
+			out.WriteString(richPlainText(label))
+			i += len(raw)
+			continue
+		}
 		if strings.HasPrefix(text[i:], "**") || strings.HasPrefix(text[i:], "__") {
 			i += 2
 			continue

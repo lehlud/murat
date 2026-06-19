@@ -2,13 +2,16 @@ package protocol
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"sync/atomic"
 
+	"lehnert.dev/murat/internal/oauth"
 	"lehnert.dev/murat/internal/store"
 )
 
@@ -19,13 +22,37 @@ type IMAPClient struct {
 }
 
 func SyncIMAPS(account store.Account, s *store.Store, limit int, progress func(string)) (int, error) {
+	return SyncIMAPSWithUpdater(account, s, limit, progress, nil)
+}
+
+func SyncIMAPSWithUpdater(account store.Account, s *store.Store, limit int, progress func(string), updateAccount func(store.Account) error) (int, error) {
+	accessToken := ""
+	if accountUsesXOAUTH2(account) {
+		var changed bool
+		var err error
+		accessToken, account, changed, err = refreshAccountAccessToken(account, account.OAuthScopes)
+		if err != nil {
+			return 0, err
+		}
+		if changed && updateAccount != nil {
+			if err := updateAccount(account); err != nil {
+				return 0, err
+			}
+		}
+	}
 	client, err := dialIMAP(account)
 	if err != nil {
 		return 0, err
 	}
 	defer client.close()
-	if err := client.login(account.Username, account.Secret); err != nil {
-		return 0, err
+	if accessToken != "" {
+		if err := client.authenticateXOAUTH2(imapUsername(account), accessToken); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := client.login(imapUsername(account), account.Secret); err != nil {
+			return 0, err
+		}
 	}
 	mailboxes := imapSyncMailboxes(account.IMAPMailbox)
 	if listed, err := client.listMailboxes(); err == nil {
@@ -41,6 +68,62 @@ func SyncIMAPS(account store.Account, s *store.Store, limit int, progress func(s
 		}
 	}
 	return count, s.Flush()
+}
+
+func refreshAccountAccessToken(account store.Account, scopes []string) (string, store.Account, bool, error) {
+	provider := strings.ToLower(strings.TrimSpace(account.OAuthProvider))
+	if provider == "" {
+		provider = "microsoft"
+	}
+	if provider != "microsoft" {
+		return "", account, false, fmt.Errorf("unsupported oauth provider: %s", provider)
+	}
+	token, err := oauth.MicrosoftRefresh(context.Background(), oauth.MicrosoftConfig{
+		Tenant:   account.OAuthTenant,
+		ClientID: account.OAuthClientID,
+		Scopes:   scopes,
+	}, account.Secret)
+	if err != nil {
+		return "", account, false, err
+	}
+	changed := false
+	if token.RefreshToken != "" && token.RefreshToken != account.Secret {
+		account.Secret = token.RefreshToken
+		changed = true
+	}
+	if len(scopes) > 0 && !equalScopes(account.OAuthScopes, scopes) {
+		account.OAuthScopes = scopes
+		changed = true
+	}
+	return token.AccessToken, account, changed, nil
+}
+
+func accountUsesXOAUTH2(account store.Account) bool {
+	switch strings.ToLower(strings.TrimSpace(account.AuthKind)) {
+	case "xoauth2", "oauth2", "microsoft", "microsoft-oauth2":
+		return true
+	default:
+		return false
+	}
+}
+
+func equalScopes(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func imapUsername(account store.Account) string {
+	if username := strings.TrimSpace(account.Username); username != "" {
+		return username
+	}
+	return strings.TrimSpace(account.Email)
 }
 
 func syncIMAPMailbox(client *IMAPClient, accountID string, s *store.Store, mailbox string, known map[string]bool, limit int, progress func(string)) (int, error) {
@@ -197,6 +280,40 @@ func (c *IMAPClient) command(format string, args ...any) ([]string, error) {
 func (c *IMAPClient) login(username, password string) error {
 	_, err := c.command("LOGIN %s %s", quoteIMAP(username), quoteIMAP(password))
 	return err
+}
+
+func (c *IMAPClient) authenticateXOAUTH2(username, accessToken string) error {
+	tag := c.nextTag()
+	if _, err := fmt.Fprintf(c.conn, "%s AUTHENTICATE XOAUTH2 %s\r\n", tag, xoauth2InitialResponse(username, accessToken)); err != nil {
+		return err
+	}
+	for {
+		line, err := c.r.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "+") {
+			if _, err := fmt.Fprintf(c.conn, "\r\n"); err != nil {
+				return err
+			}
+			continue
+		}
+		if strings.HasPrefix(line, tag+" ") {
+			if strings.Contains(line, " OK") {
+				return nil
+			}
+			return fmt.Errorf("imap xoauth2 failed: %s", line)
+		}
+	}
+}
+
+func xoauth2InitialResponse(username, accessToken string) string {
+	return base64.StdEncoding.EncodeToString(xoauth2SASL(username, accessToken))
+}
+
+func xoauth2SASL(username, accessToken string) []byte {
+	return []byte("user=" + username + "\x01auth=Bearer " + accessToken + "\x01\x01")
 }
 
 func (c *IMAPClient) selectMailbox(mailbox string) error {

@@ -11,24 +11,28 @@ import (
 )
 
 type Account struct {
-	ID                   string `json:"id"`
-	Name                 string `json:"name"`
-	Email                string `json:"email"`
-	Protocol             string `json:"protocol"`
-	Username             string `json:"username"`
-	Secret               string `json:"secret"`
-	AuthKind             string `json:"auth_kind"`
-	SessionURL           string `json:"session_url"`
-	PrimaryMailAccountID string `json:"primary_mail_account_id,omitempty"`
-	IMAPHost             string `json:"imap_host"`
-	IMAPPort             int    `json:"imap_port"`
-	IMAPMailbox          string `json:"imap_mailbox"`
-	SMTPHost             string `json:"smtp_host"`
-	SMTPPort             int    `json:"smtp_port"`
-	SMTPUsername         string `json:"smtp_username"`
-	SMTPSecret           string `json:"smtp_secret"`
-	CreatedAt            string `json:"created_at,omitempty"`
-	UpdatedAt            string `json:"updated_at,omitempty"`
+	ID                   string   `json:"id"`
+	Name                 string   `json:"name"`
+	Email                string   `json:"email"`
+	Protocol             string   `json:"protocol"`
+	Username             string   `json:"username"`
+	Secret               string   `json:"secret"`
+	AuthKind             string   `json:"auth_kind"`
+	SessionURL           string   `json:"session_url"`
+	OAuthProvider        string   `json:"oauth_provider,omitempty"`
+	OAuthTenant          string   `json:"oauth_tenant,omitempty"`
+	OAuthClientID        string   `json:"oauth_client_id,omitempty"`
+	OAuthScopes          []string `json:"oauth_scopes,omitempty"`
+	PrimaryMailAccountID string   `json:"primary_mail_account_id,omitempty"`
+	IMAPHost             string   `json:"imap_host"`
+	IMAPPort             int      `json:"imap_port"`
+	IMAPMailbox          string   `json:"imap_mailbox"`
+	SMTPHost             string   `json:"smtp_host"`
+	SMTPPort             int      `json:"smtp_port"`
+	SMTPUsername         string   `json:"smtp_username"`
+	SMTPSecret           string   `json:"smtp_secret"`
+	CreatedAt            string   `json:"created_at,omitempty"`
+	UpdatedAt            string   `json:"updated_at,omitempty"`
 }
 
 type AccountIndex struct {

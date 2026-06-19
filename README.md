@@ -61,6 +61,14 @@ Add an IMAP account:
 murat account add-imap --email you@example.com
 ```
 
+For Exchange Online, register a public client app in Microsoft Entra with
+delegated `https://outlook.office.com/IMAP.AccessAsUser.All` and
+`https://outlook.office.com/SMTP.Send` permissions, then use device-code login:
+
+```sh
+murat account add-exchange-online --email you@example.com --oauth-client-id CLIENT_ID
+```
+
 Or add a JMAP account:
 
 ```sh
@@ -84,6 +92,7 @@ Common commands:
 murat init --gpg-key KEY
 murat account list
 murat account add-imap
+murat account add-exchange-online
 murat account add-jmap
 murat sync [--account ID_OR_EMAIL] [--limit N]
 murat compose --to you@example.com

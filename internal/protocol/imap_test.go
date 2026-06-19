@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/base64"
 	"reflect"
 	"testing"
 )
@@ -62,5 +63,16 @@ func TestSentIMAPMailboxPrefersFirstSent(t *testing.T) {
 	got := sentIMAPMailbox([]imapMailboxInfo{{name: "Archive"}, {name: "Sent", sent: true}})
 	if got != "Sent" {
 		t.Fatalf("sentIMAPMailbox() = %q, want Sent", got)
+	}
+}
+
+func TestXOAUTH2InitialResponse(t *testing.T) {
+	got, err := base64.StdEncoding.DecodeString(xoauth2InitialResponse("user@example.com", "access"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "user=user@example.com\x01auth=Bearer access\x01\x01"
+	if string(got) != want {
+		t.Fatalf("xoauth2 response = %q", string(got))
 	}
 }

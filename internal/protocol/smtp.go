@@ -6,12 +6,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"mime/multipart"
+	"net"
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
 	"strings"
 	"time"
 
+	"lehnert.dev/murat/internal/oauth"
 	"lehnert.dev/murat/internal/store"
 )
 
@@ -33,6 +35,10 @@ type Attachment struct {
 }
 
 func SendSMTPS(account store.Account, draft Draft) error {
+	return SendSMTPSWithUpdater(account, draft, nil)
+}
+
+func SendSMTPSWithUpdater(account store.Account, draft Draft, updateAccount func(store.Account) error) error {
 	host := account.SMTPHost
 	port := account.SMTPPort
 	if port == 0 {
@@ -41,13 +47,21 @@ func SendSMTPS(account store.Account, draft Draft) error {
 	if host == "" {
 		return fmt.Errorf("smtp_host missing")
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
-	conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
-	if err != nil {
-		return err
+	accessToken := ""
+	if accountUsesXOAUTH2(account) {
+		var changed bool
+		var err error
+		accessToken, account, changed, err = refreshAccountAccessToken(account, smtpOAuthScopes(account.OAuthScopes))
+		if err != nil {
+			return err
+		}
+		if changed && updateAccount != nil {
+			if err := updateAccount(account); err != nil {
+				return err
+			}
+		}
 	}
-	defer conn.Close()
-	client, err := smtp.NewClient(conn, host)
+	client, err := dialSMTP(host, port)
 	if err != nil {
 		return err
 	}
@@ -60,7 +74,11 @@ func SendSMTPS(account store.Account, draft Draft) error {
 	if secret == "" {
 		secret = account.Secret
 	}
-	if username != "" || secret != "" {
+	if accessToken != "" {
+		if err := client.Auth(xoauth2SMTPAuth{username: smtpUsername(account), accessToken: accessToken}); err != nil {
+			return err
+		}
+	} else if username != "" || secret != "" {
 		if err := client.Auth(smtp.PlainAuth("", username, secret, host)); err != nil {
 			return err
 		}
@@ -87,6 +105,82 @@ func SendSMTPS(account store.Account, draft Draft) error {
 		err = closeErr
 	}
 	return err
+}
+
+func dialSMTP(host string, port int) (*smtp.Client, error) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	if port == 587 {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		client, err := smtp.NewClient(conn, host)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if err := client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
+			_ = client.Close()
+			return nil, err
+		}
+		return client, nil
+	}
+	conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		return nil, err
+	}
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+type xoauth2SMTPAuth struct {
+	username    string
+	accessToken string
+}
+
+func (a xoauth2SMTPAuth) Start(*smtp.ServerInfo) (string, []byte, error) {
+	return "XOAUTH2", xoauth2SASL(a.username, a.accessToken), nil
+}
+
+func (a xoauth2SMTPAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if more {
+		return nil, fmt.Errorf("smtp xoauth2 failed: %s", strings.TrimSpace(string(fromServer)))
+	}
+	return nil, nil
+}
+
+func smtpUsername(account store.Account) string {
+	if username := strings.TrimSpace(account.SMTPUsername); username != "" {
+		return username
+	}
+	return imapUsername(account)
+}
+
+func smtpOAuthScopes(scopes []string) []string {
+	if len(scopes) == 0 {
+		return oauth.DefaultMicrosoftMailScopes()
+	}
+	out := append([]string(nil), scopes...)
+	if !hasScope(out, oauth.ScopeMicrosoftSMTP) {
+		out = append(out, oauth.ScopeMicrosoftSMTP)
+	}
+	if !hasScope(out, oauth.ScopeOfflineAccess) {
+		out = append(out, oauth.ScopeOfflineAccess)
+	}
+	return out
+}
+
+func hasScope(scopes []string, scope string) bool {
+	for _, item := range scopes {
+		if item == scope {
+			return true
+		}
+	}
+	return false
 }
 
 func Message(account store.Account, draft Draft) string {

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"lehnert.dev/murat/internal/oauth"
 	"lehnert.dev/murat/internal/store"
 )
 
@@ -37,5 +38,26 @@ func TestMessageUsesDraftFrom(t *testing.T) {
 	msg := Message(store.Account{Email: "fallback@example.com"}, Draft{From: "Alice <alice@example.com>", To: "bob@example.com", Body: "body"})
 	if !strings.Contains(msg, "From: Alice <alice@example.com>") {
 		t.Fatalf("message = %q", msg)
+	}
+}
+
+func TestXOAUTH2SMTPAuth(t *testing.T) {
+	mechanism, response, err := (xoauth2SMTPAuth{username: "user@example.com", accessToken: "access"}).Start(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mechanism != "XOAUTH2" {
+		t.Fatalf("mechanism = %q", mechanism)
+	}
+	want := "user=user@example.com\x01auth=Bearer access\x01\x01"
+	if string(response) != want {
+		t.Fatalf("response = %q", string(response))
+	}
+}
+
+func TestSMTPOAuthScopesAddsSend(t *testing.T) {
+	scopes := smtpOAuthScopes([]string{oauth.ScopeMicrosoftIMAP})
+	if !hasScope(scopes, oauth.ScopeMicrosoftIMAP) || !hasScope(scopes, oauth.ScopeMicrosoftSMTP) || !hasScope(scopes, oauth.ScopeOfflineAccess) {
+		t.Fatalf("scopes = %#v", scopes)
 	}
 }
