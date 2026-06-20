@@ -483,6 +483,20 @@ func (s *Store) KnownRemoteIDs(accountID string) map[string]bool {
 	return out
 }
 
+func (s *Store) RemoteMessage(accountID, remoteID string) (*Message, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, msg := range s.index.Messages {
+		if msg == nil || msg.RemoteID == "" {
+			continue
+		}
+		if msg.RemoteID == remoteID && (accountID == "" || msg.AccountID == accountID) {
+			return msg, true
+		}
+	}
+	return nil, false
+}
+
 func (s *Store) KnownAddresses() []KnownAddress {
 	s.mu.RLock()
 	out := make([]KnownAddress, 0, len(s.index.KnownAddresses))
@@ -1454,11 +1468,7 @@ func extractMailText(header mail.Header, body io.Reader) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	text := decodeBytes(data, params["charset"])
-	if strings.HasPrefix(strings.ToLower(mediaType), "text/html") {
-		return htmlToRichText(text), false, nil
-	}
-	return text, false, nil
+	return decodeTextBody(data, params["charset"], mediaType), false, nil
 }
 
 func extractMultipart(reader *multipart.Reader) (string, string, bool, error) {
@@ -1506,12 +1516,26 @@ func extractMultipart(reader *multipart.Reader) (string, string, bool, error) {
 		}
 		switch strings.ToLower(mediaType) {
 		case "text/plain":
-			plain = append(plain, decodeBytes(data, params["charset"]))
+			plain = append(plain, decodeTextBody(data, params["charset"], mediaType))
 		case "text/html":
 			html = append(html, decodeBytes(data, params["charset"]))
 		}
 	}
 	return strings.Join(plain, "\n\n"), strings.Join(html, "\n\n"), hasAttachment, nil
+}
+
+func decodeTextBody(data []byte, charset, mediaType string) string {
+	text := decodeBytes(data, charset)
+	if strings.HasPrefix(strings.ToLower(mediaType), "text/html") || looksLikeHTMLDocument(text) {
+		return htmlToRichText(text)
+	}
+	return text
+}
+
+func looksLikeHTMLDocument(text string) bool {
+	text = strings.TrimLeft(text, "\ufeff \t\r\n")
+	text = strings.ToLower(text)
+	return strings.HasPrefix(text, "<!doctype html") || strings.HasPrefix(text, "<html") || strings.HasPrefix(text, "<head") || strings.HasPrefix(text, "<body")
 }
 
 func extractAttachments(header mail.Header, body io.Reader, out *[]Attachment) error {

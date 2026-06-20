@@ -464,7 +464,7 @@ func Run(s *store.Store, accounts *store.AccountStore, options Options) error {
 	}
 	pageSize := options.PageSize
 	if pageSize <= 0 {
-		pageSize = 100
+		pageSize = 350
 	}
 	app := &App{
 		store:       s,
@@ -616,12 +616,32 @@ func (a *App) reload() {
 		filtered = append(filtered, msg)
 	}
 	a.messages = filtered
+	if a.preview != nil && !messageInList(a.preview, a.messages) {
+		a.preview = nil
+		a.previewBody = ""
+		a.previewHead = ""
+		a.headerMode = false
+		a.bodyScroll = 0
+		a.clearSelection()
+	}
 	if a.selected >= len(a.messages) {
 		a.selected = len(a.messages) - 1
 	}
 	if a.selected < 0 {
 		a.selected = 0
 	}
+}
+
+func messageInList(msg *store.Message, messages []*store.Message) bool {
+	if msg == nil {
+		return false
+	}
+	for _, item := range messages {
+		if item != nil && item.Key == msg.Key {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) filteredSourceMessages() []*store.Message {
@@ -1815,6 +1835,12 @@ func (a *App) drawList(y, x, height, width int) {
 		return
 	}
 	if len(a.messages) == 0 {
+		if a.filter == "search" {
+			for row := 0; row < height; row++ {
+				printLine(y+row, x, width, "")
+			}
+			return
+		}
 		printLine(y, x, width, "no mail; press "+a.keys.Sync+" to sync")
 		return
 	}

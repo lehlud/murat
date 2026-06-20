@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/mail"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"time"
@@ -21,7 +23,15 @@ const capSubmission = "urn:ietf:params:jmap:submission"
 type jmapSession struct {
 	APIURL          string            `json:"apiUrl"`
 	UploadURL       string            `json:"uploadUrl"`
+	DownloadURL     string            `json:"downloadUrl"`
 	PrimaryAccounts map[string]string `json:"primaryAccounts"`
+}
+
+type jmapAttachmentData struct {
+	Filename    string
+	ContentType string
+	BlobID      string
+	Data        []byte
 }
 
 type jmapUploadResponse struct {
@@ -66,9 +76,9 @@ func SyncJMAP(account store.Account, s *store.Store, limit int, progress func(st
 		return 0, err
 	}
 	known := s.KnownRemoteIDs(account.ID)
-	ids = filterUnknownJMAPIDs(ids, known, limit)
+	ids = jmapFetchIDs(ids, account.ID, s, known, limit)
 	if progress != nil {
-		progress(fmt.Sprintf("%d new messages", len(ids)))
+		progress(fmt.Sprintf("%d messages to fetch", len(ids)))
 	}
 	if len(ids) == 0 {
 		return 0, s.Flush()
@@ -80,24 +90,67 @@ func SyncJMAP(account store.Account, s *store.Store, limit int, progress func(st
 	if err != nil {
 		return 0, err
 	}
+	count := 0
 	for i, item := range items {
 		if progress != nil {
 			progress(fmt.Sprintf("import %d/%d", i+1, len(items)))
 		}
 		remoteID := jmapRemoteID(stringValue(item["id"]))
-		raw := jmapEmailToEML(account, item)
+		existing, replaceExisting := s.RemoteMessage(account.ID, remoteID)
+		if known[remoteID] && (!replaceExisting || existing.HasAttachment || !jmapHasAttachment(item)) {
+			continue
+		}
+		raw, err := jmapEmailToEML(account, session, mailAccount, item)
+		if err != nil {
+			return 0, err
+		}
 		msg, err := s.ImportRaw([]byte(raw))
 		if err != nil {
 			return 0, err
 		}
 		msg.SetRemote(account.ID, remoteID)
-		msg.SetRead(jmapRead(item))
-		msg.SetTags(jmapTags(item))
+		if replaceExisting {
+			msg.SetRead(existing.Read)
+			msg.SetSpam(existing.Spam)
+			if existing.Trashed {
+				msg.MarkTrashed()
+			}
+			msg.SetTags(existing.Tags)
+			if existing.Key != msg.Key {
+				_ = s.RemoveMessage(existing.Key, true)
+			}
+		} else {
+			msg.SetRead(jmapRead(item))
+			msg.SetTags(jmapTags(item))
+		}
 		if remoteID != "" {
 			known[remoteID] = true
 		}
+		count++
 	}
-	return len(items), s.Flush()
+	return count, s.Flush()
+}
+
+func jmapFetchIDs(ids []string, accountID string, s *store.Store, known map[string]bool, limit int) []string {
+	out := filterUnknownJMAPIDs(ids, known, limit)
+	seen := map[string]bool{}
+	for _, id := range out {
+		seen[id] = true
+	}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		remoteID := jmapRemoteID(id)
+		if !known[remoteID] {
+			continue
+		}
+		if msg, ok := s.RemoteMessage(accountID, remoteID); ok && !msg.HasAttachment {
+			out = append(out, id)
+			seen[id] = true
+		}
+	}
+	return out
 }
 
 func filterUnknownJMAPIDs(ids []string, known map[string]bool, limit int) []string {
@@ -366,8 +419,8 @@ func jmapGet(account store.Account, apiURL, mailAccount string, ids []string) ([
 	body := jmapRequest{Using: []string{capMail}, MethodCalls: [][]any{{"Email/get", map[string]any{
 		"accountId":           mailAccount,
 		"ids":                 idsAny,
-		"properties":          []string{"id", "receivedAt", "sentAt", "subject", "keywords", "mailboxIds", "from", "to", "cc", "bodyValues", "textBody", "htmlBody", "hasAttachment"},
-		"bodyProperties":      []string{"partId", "type"},
+		"properties":          []string{"id", "receivedAt", "sentAt", "subject", "keywords", "mailboxIds", "from", "to", "cc", "bodyValues", "textBody", "htmlBody", "attachments", "hasAttachment"},
+		"bodyProperties":      []string{"partId", "blobId", "size", "name", "type", "disposition", "cid"},
 		"fetchTextBodyValues": true,
 		"fetchHTMLBodyValues": true,
 		"maxBodyValueBytes":   500000,
@@ -447,8 +500,19 @@ func setAuthHeader(req *http.Request, account store.Account) {
 	}
 }
 
-func jmapEmailToEML(account store.Account, item map[string]any) string {
+func jmapEmailToEML(account store.Account, session *jmapSession, mailAccount string, item map[string]any) (string, error) {
 	body := jmapBody(item)
+	attachments, err := jmapDownloadAttachments(account, session, mailAccount, item)
+	if err != nil {
+		return "", err
+	}
+	if len(attachments) > 0 {
+		return jmapMultipartEmail(item, body, attachments), nil
+	}
+	return strings.Join(append(jmapEmailHeaders(item), "Content-Type: text/plain; charset=utf-8", "", body), "\r\n"), nil
+}
+
+func jmapEmailHeaders(item map[string]any) []string {
 	date := stringValue(item["receivedAt"])
 	if date == "" {
 		date = stringValue(item["sentAt"])
@@ -456,17 +520,113 @@ func jmapEmailToEML(account store.Account, item map[string]any) string {
 	if date == "" {
 		date = time.Now().Format(time.RFC3339)
 	}
-	return strings.Join([]string{
+	return []string{
 		"From: " + firstAddress(item["from"]),
 		"To: " + addresses(item["to"]),
 		"Cc: " + addresses(item["cc"]),
 		"Subject: " + stringValue(item["subject"]),
 		"Date: " + date,
+		"MIME-Version: 1.0",
 		"X-Murat-JMAP-ID: " + stringValue(item["id"]),
-		"Content-Type: text/plain; charset=utf-8",
-		"",
-		body,
-	}, "\r\n")
+	}
+}
+
+func jmapMultipartEmail(item map[string]any, body string, attachments []jmapAttachmentData) string {
+	var out bytes.Buffer
+	writer := multipart.NewWriter(&out)
+	headers := append(jmapEmailHeaders(item), "Content-Type: multipart/mixed; boundary="+writer.Boundary())
+	out.WriteString(strings.Join(headers, "\r\n"))
+	out.WriteString("\r\n\r\n")
+
+	textHeader := textproto.MIMEHeader{}
+	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
+	textPart, _ := writer.CreatePart(textHeader)
+	_, _ = textPart.Write([]byte(body))
+
+	for i, attachment := range attachments {
+		name := attachment.Filename
+		if strings.TrimSpace(name) == "" {
+			name = fmt.Sprintf("attachment-%d", i+1)
+		}
+		contentType := attachment.ContentType
+		if strings.TrimSpace(contentType) == "" {
+			contentType = "application/octet-stream"
+		}
+		header := textproto.MIMEHeader{}
+		header.Set("Content-Type", contentType+"; name=\""+escapeMIMEParam(name)+"\"")
+		header.Set("Content-Disposition", "attachment; filename=\""+escapeMIMEParam(name)+"\"")
+		header.Set("Content-Transfer-Encoding", "base64")
+		part, _ := writer.CreatePart(header)
+		writeBase64(part, attachment.Data)
+	}
+	_ = writer.Close()
+	return out.String()
+}
+
+func jmapDownloadAttachments(account store.Account, session *jmapSession, mailAccount string, item map[string]any) ([]jmapAttachmentData, error) {
+	infos := jmapAttachmentInfos(item)
+	if len(infos) == 0 {
+		return nil, nil
+	}
+	if session == nil || strings.TrimSpace(session.DownloadURL) == "" {
+		return nil, fmt.Errorf("JMAP message has attachments but session missing downloadUrl")
+	}
+	out := make([]jmapAttachmentData, 0, len(infos))
+	for _, info := range infos {
+		if strings.TrimSpace(info.BlobID) == "" {
+			continue
+		}
+		data, err := jmapDownload(account, session.DownloadURL, mailAccount, info.BlobID, info.Filename, info.ContentType)
+		if err != nil {
+			return nil, err
+		}
+		info.Data = data
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+func jmapAttachmentInfos(item map[string]any) []jmapAttachmentData {
+	items, _ := item["attachments"].([]any)
+	out := []jmapAttachmentData{}
+	for _, item := range items {
+		part, _ := item.(map[string]any)
+		name := stringValue(part["name"])
+		if name == "" {
+			name = stringValue(part["filename"])
+		}
+		contentType := stringValue(part["type"])
+		out = append(out, jmapAttachmentData{Filename: name, ContentType: contentType, BlobID: stringValue(part["blobId"])})
+	}
+	return out
+}
+
+func jmapDownload(account store.Account, templateURL, accountID, blobID, name, contentType string) ([]byte, error) {
+	if strings.TrimSpace(name) == "" {
+		name = "attachment"
+	}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/octet-stream"
+	}
+	target := strings.ReplaceAll(templateURL, "{accountId}", url.PathEscape(accountID))
+	target = strings.ReplaceAll(target, "{blobId}", url.PathEscape(blobID))
+	target = strings.ReplaceAll(target, "{name}", url.PathEscape(name))
+	target = strings.ReplaceAll(target, "{type}", url.PathEscape(contentType))
+	req, err := http.NewRequest("GET", target, nil)
+	if err != nil {
+		return nil, err
+	}
+	setAuthHeader(req, account)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return nil, fmt.Errorf("HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return io.ReadAll(res.Body)
 }
 
 func jmapBody(item map[string]any) string {
@@ -490,6 +650,14 @@ func jmapRead(item map[string]any) bool {
 	keywords, _ := item["keywords"].(map[string]any)
 	seen, _ := keywords["$seen"].(bool)
 	return seen
+}
+
+func jmapHasAttachment(item map[string]any) bool {
+	if value, ok := item["hasAttachment"].(bool); ok && value {
+		return true
+	}
+	items, _ := item["attachments"].([]any)
+	return len(items) > 0
 }
 
 func jmapTags(item map[string]any) []string {

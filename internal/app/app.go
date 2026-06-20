@@ -28,6 +28,8 @@ import (
 
 var commit = "dev"
 
+const defaultSyncLimit = 350
+
 func Main(args []string) error {
 	if len(args) == 0 {
 		args = []string{"tui"}
@@ -887,7 +889,7 @@ func cmdSync(args []string) error {
 	if helpRequested(args) {
 		fs := commandFlagSet("sync", usageSync)
 		fs.String("account", "", "account id/email")
-		fs.Int("limit", 100, "max messages per account; 0 = all")
+		fs.Int("limit", defaultSyncLimit, "max messages per account; 0 = all")
 		fs.Usage()
 		return nil
 	}
@@ -895,7 +897,7 @@ func cmdSync(args []string) error {
 	if err != nil {
 		return err
 	}
-	defaultLimit := 100
+	defaultLimit := defaultSyncLimit
 	if cfg.UI.PageSize > 0 {
 		defaultLimit = cfg.UI.PageSize
 	}

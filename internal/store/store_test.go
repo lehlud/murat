@@ -134,6 +134,28 @@ func TestHTMLToRichTextPreservesAnchors(t *testing.T) {
 	}
 }
 
+func TestTextPlainHTMLDocumentWithNoTextIsEmpty(t *testing.T) {
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: html-empty\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\n<html>\r\n<head>\r\n<meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\">\r\n<style type=\"text/css\" style=\"display:none;\"> P {margin-top:0;margin-bottom:0;} </style>\r\n</head>\r\n<body dir=\"ltr\">\r\n<div style=\"font-family: Aptos, Calibri, sans-serif; font-size: 10pt; color: rgb(0, 0, 0);\"><br></div>\r\n</body>\r\n</html>\r\n")
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestTextPlainHTMLDocumentWithTextIsConverted(t *testing.T) {
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: html-text\r\nContent-Type: text/plain\r\n\r\n<html><body><p>Hello <strong>world</strong></p></body></html>\r\n")
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "Hello **world**" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
 func TestDecodeWindows1252Body(t *testing.T) {
 	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: cp1252\r\nContent-Type: text/plain; charset=windows-1252\r\n\r\n\x93hello\x94 \x80\r\n")
 	_, body, _, err := parseRaw(raw)
