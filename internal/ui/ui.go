@@ -600,6 +600,10 @@ func (a *App) reload() {
 			if !msg.IsSpam() {
 				continue
 			}
+		case "dmarc":
+			if a.store.ReportCategory(msg) != "dmarc" {
+				continue
+			}
 		case "sent":
 			if !msg.IsSent() {
 				continue
@@ -669,6 +673,8 @@ func (a *App) filteredSourceMessages() []*store.Message {
 	switch a.filter {
 	case "spam":
 		return a.store.MessagesAll(true, false)
+	case "dmarc":
+		return a.store.MessagesCategory("dmarc")
 	case "sent":
 		return a.store.MessagesAll(false, true)
 	case "drafts":
@@ -825,6 +831,8 @@ func (a *App) handleFilterAction(key string) {
 		a.status = ""
 	case "s":
 		a.setFilter("spam")
+	case "m":
+		a.setFilter("dmarc")
 	case "e":
 		a.setFilter("sent")
 	case "D":
@@ -1169,6 +1177,13 @@ func (a *App) openSelected() {
 	a.preview = msg
 	a.previewHead = body.Headers
 	text, status, _ := pgp.ProcessTextWithKeys(body.Text, a.publicKeyAttachments(msg))
+	if report := a.aggregateReportPreview(msg); report != "" {
+		if strings.TrimSpace(text) == "" {
+			text = report
+		} else {
+			text = report + "\n\n" + text
+		}
+	}
 	a.previewBody = text
 	a.headerMode = false
 	a.bodyScroll = 0
@@ -2030,7 +2045,7 @@ func (a *App) shortcuts() string {
 		return "mail: r reply  R reply-all  f forward  h headers  a attach  u unread  t trash  s spam  esc back"
 	}
 	if a.actionScope == "filter" {
-		return "filter: s spam  e sent  D drafts  r read  u unread  d today  7 7 days  c clear  esc back"
+		return "filter: s spam  m dmarc  e sent  D drafts  r read  u unread  d today  7 7 days  c clear  esc back"
 	}
 	if a.actionScope == "link" {
 		return "link: enter open  c copy  esc cancel"

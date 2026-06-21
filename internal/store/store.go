@@ -54,25 +54,27 @@ type SearchIndex struct {
 }
 
 type Message struct {
-	store         *Store `json:"-"`
-	extra         map[string]json.RawMessage
-	Key           string   `json:"key"`
-	AccountID     string   `json:"account_id,omitempty"`
-	From          string   `json:"from,omitempty"`
-	To            []string `json:"to,omitempty"`
-	Cc            []string `json:"cc,omitempty"`
-	Subject       string   `json:"subject,omitempty"`
-	ReceivedAt    string   `json:"received_at,omitempty"`
-	SentAt        string   `json:"sent_at,omitempty"`
-	Read          bool     `json:"read,omitempty"`
-	Spam          bool     `json:"spam,omitempty"`
-	Trashed       bool     `json:"trashed,omitempty"`
-	Tags          []string `json:"tags,omitempty"`
-	RemoteID      string   `json:"remote_id,omitempty"`
-	HasAttachment bool     `json:"has_attachment,omitempty"`
-	RawRel        string   `json:"eml_rel,omitempty"`
-	BodyRel       string   `json:"body_rel,omitempty"`
-	RawSize       int      `json:"raw_size,omitempty"`
+	store          *Store `json:"-"`
+	extra          map[string]json.RawMessage
+	Key            string   `json:"key"`
+	AccountID      string   `json:"account_id,omitempty"`
+	From           string   `json:"from,omitempty"`
+	To             []string `json:"to,omitempty"`
+	Cc             []string `json:"cc,omitempty"`
+	Subject        string   `json:"subject,omitempty"`
+	ReceivedAt     string   `json:"received_at,omitempty"`
+	SentAt         string   `json:"sent_at,omitempty"`
+	Read           bool     `json:"read,omitempty"`
+	Spam           bool     `json:"spam,omitempty"`
+	Trashed        bool     `json:"trashed,omitempty"`
+	Tags           []string `json:"tags,omitempty"`
+	RemoteID       string   `json:"remote_id,omitempty"`
+	HasAttachment  bool     `json:"has_attachment,omitempty"`
+	ReportCategory string   `json:"report_category,omitempty"`
+	ReportChecked  bool     `json:"report_checked,omitempty"`
+	RawRel         string   `json:"eml_rel,omitempty"`
+	BodyRel        string   `json:"body_rel,omitempty"`
+	RawSize        int      `json:"raw_size,omitempty"`
 }
 
 func (m *Message) UnmarshalJSON(data []byte) error {
@@ -85,7 +87,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	for _, key := range []string{"key", "account_id", "from", "to", "cc", "subject", "received_at", "sent_at", "read", "spam", "trashed", "tags", "remote_id", "has_attachment", "eml_rel", "body_rel", "raw_size"} {
+	for _, key := range []string{"key", "account_id", "from", "to", "cc", "subject", "received_at", "sent_at", "read", "spam", "trashed", "tags", "remote_id", "has_attachment", "report_category", "report_checked", "eml_rel", "body_rel", "raw_size"} {
 		delete(raw, key)
 	}
 	if value.RawRel == "" {
@@ -356,20 +358,53 @@ func (s *Store) flushLoop() {
 func (s *Store) Flush() error { return s.Save() }
 
 func (s *Store) Messages(includeSpam bool) []*Message {
-	return s.MessagesAll(includeSpam, false)
+	return s.messagesFiltered(includeSpam, false, false)
 }
 
 func (s *Store) MessagesAll(includeSpam, includeSent bool) []*Message {
-	s.mu.RLock()
-	out := make([]*Message, 0, len(s.index.Messages))
-	for _, msg := range s.index.Messages {
-		if msg.Trashed || (!includeSpam && msg.IsSpam()) || (!includeSent && msg.IsSent()) || msg.RawRel == "" {
+	return s.messagesFiltered(includeSpam, includeSent, true)
+}
+
+func (s *Store) MessagesCategory(category string) []*Message {
+	category = strings.ToLower(strings.TrimSpace(category))
+	if category == "" {
+		return nil
+	}
+	messages := s.messagesSnapshot()
+	out := make([]*Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Trashed || msg.RawRel == "" || msg.IsSent() {
+			continue
+		}
+		if s.ReportCategory(msg) != category {
 			continue
 		}
 		out = append(out, msg)
 	}
-	s.mu.RUnlock()
 	sortMessages(out)
+	return out
+}
+
+func (s *Store) messagesFiltered(includeSpam, includeSent, includeReports bool) []*Message {
+	messages := s.messagesSnapshot()
+	out := make([]*Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Trashed || (!includeSpam && msg.IsSpam()) || (!includeSent && msg.IsSent()) || (!includeReports && s.ReportCategory(msg) != "") || msg.RawRel == "" {
+			continue
+		}
+		out = append(out, msg)
+	}
+	sortMessages(out)
+	return out
+}
+
+func (s *Store) messagesSnapshot() []*Message {
+	s.mu.RLock()
+	out := make([]*Message, 0, len(s.index.Messages))
+	for _, msg := range s.index.Messages {
+		out = append(out, msg)
+	}
+	s.mu.RUnlock()
 	return out
 }
 
@@ -561,6 +596,11 @@ func (s *Store) ImportRaw(raw []byte) (*Message, error) {
 	key := hex.EncodeToString(sum[:])
 	rel := emlRelForKey(key)
 	msg := messageFromMail(key, parsed, raw, rel, hasAttachment)
+	if hasAttachment {
+		msg.ReportCategory, msg.ReportChecked = reportCategoryFromRaw(raw)
+	} else {
+		msg.ReportChecked = true
+	}
 	if err := s.writeEncrypted(filepath.Join(s.paths.RawDir, rel), raw); err != nil {
 		return nil, err
 	}
@@ -575,6 +615,10 @@ func (s *Store) ImportRaw(raw []byte) (*Message, error) {
 		msg.Read = existing.Read
 		msg.Spam = existing.Spam
 		msg.Trashed = existing.Trashed
+		if existing.ReportChecked && (existing.ReportCategory != "" || msg.ReportCategory == "") {
+			msg.ReportCategory = existing.ReportCategory
+			msg.ReportChecked = existing.ReportChecked
+		}
 	}
 	msg.store = s
 	s.index.Messages[key] = msg
@@ -784,6 +828,9 @@ func (m *Message) FolderColumn() string {
 	}
 	if m.IsDraft() {
 		return "draft"
+	}
+	if cleanReportCategory(m.ReportCategory) == aggregateReportCategory {
+		return aggregateReportCategory
 	}
 	candidates := m.folderTags()
 	if len(candidates) == 0 {

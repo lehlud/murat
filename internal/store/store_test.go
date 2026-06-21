@@ -2,8 +2,11 @@ package store
 
 import (
 	"bytes"
+	"compress/gzip"
+	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -341,6 +344,129 @@ func TestMessagesExcludeMailboxSpam(t *testing.T) {
 		t.Fatalf("Messages(true) len = %d, want 1", len(got))
 	}
 }
+
+func TestAggregateReportDMARCImportAndFilter(t *testing.T) {
+	s, err := Open(testPaths(t.TempDir()), bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := s.ImportRaw(reportMail("dmarc.xml", "application/xml", []byte(dmarcXMLReport)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.ReportCategory != "dmarc" || !msg.ReportChecked {
+		t.Fatalf("report category = %q checked=%v", msg.ReportCategory, msg.ReportChecked)
+	}
+	if got := s.Messages(false); len(got) != 0 {
+		t.Fatalf("regular inbox len = %d, want 0", len(got))
+	}
+	if got := s.MessagesCategory("dmarc"); len(got) != 1 {
+		t.Fatalf("dmarc category len = %d, want 1", len(got))
+	}
+	if got := msg.FolderColumn(); got != "dmarc" {
+		t.Fatalf("folder column = %q, want dmarc", got)
+	}
+	report, err := s.AggregateReport(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report == nil || report.Kind != "DMARC" || report.Domain != "example.com" || len(report.Rows) != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestAggregateReportTLSGzipImport(t *testing.T) {
+	s, err := Open(testPaths(t.TempDir()), bytes.Repeat([]byte{5}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := s.ImportRaw(reportMail("google.com!ludwig-lehnert.de!report.json.gz", "application/gzip", gzipBytes([]byte(tlsJSONReport))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.ReportCategory != "dmarc" {
+		t.Fatalf("report category = %q", msg.ReportCategory)
+	}
+	report, err := s.AggregateReport(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report == nil || report.Kind != "TLSRPT" || report.Organization != "google.com" || report.Domain != "ludwig-lehnert.de" {
+		t.Fatalf("report = %#v", report)
+	}
+	if len(report.Rows) != 2 || report.Rows[0].Count != "12/1" || report.Rows[1].Result != "certificate-host-mismatch" {
+		t.Fatalf("report rows = %#v", report.Rows)
+	}
+}
+
+func reportMail(filename, contentType string, data []byte) []byte {
+	encoded := base64.StdEncoding.EncodeToString(data)
+	return []byte(strings.Join([]string{
+		"From: reports@example.com",
+		"To: postmaster@example.com",
+		"Subject: Report Domain: example.com",
+		"Date: Sun, 21 Jun 2026 12:57:39 +0000",
+		"Content-Type: multipart/mixed; boundary=abc",
+		"",
+		"--abc",
+		"Content-Type: text/plain",
+		"",
+		"This is an aggregate report.",
+		"--abc",
+		"Content-Type: " + contentType,
+		"Content-Disposition: attachment; filename=" + filename,
+		"Content-Transfer-Encoding: base64",
+		"",
+		encoded,
+		"--abc--",
+		"",
+	}, "\r\n"))
+}
+
+func gzipBytes(data []byte) []byte {
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, _ = writer.Write(data)
+	_ = writer.Close()
+	return buf.Bytes()
+}
+
+const dmarcXMLReport = `<?xml version="1.0" encoding="UTF-8"?>
+<feedback>
+  <report_metadata>
+    <org_name>Example Reporter</org_name>
+    <email>reports@example.net</email>
+    <report_id>report-1</report_id>
+    <date_range><begin>1782000000</begin><end>1782086400</end></date_range>
+  </report_metadata>
+  <policy_published>
+    <domain>example.com</domain>
+    <p>reject</p>
+  </policy_published>
+  <record>
+    <row>
+      <source_ip>192.0.2.1</source_ip>
+      <count>3</count>
+      <policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>fail</spf></policy_evaluated>
+    </row>
+    <identifiers><header_from>example.com</header_from></identifiers>
+    <auth_results>
+      <dkim><domain>example.com</domain><result>pass</result></dkim>
+      <spf><domain>mail.example.com</domain><result>fail</result></spf>
+    </auth_results>
+  </record>
+</feedback>`
+
+const tlsJSONReport = `{
+  "organization-name": "google.com",
+  "date-range": {"start-datetime": "2026-06-20T00:00:00Z", "end-datetime": "2026-06-21T00:00:00Z"},
+  "report-id": "2026.06.20T00.00.00Z+ludwig-lehnert.de@google.com",
+  "policies": [{
+    "policy": {"policy-type": "sts", "policy-domain": "ludwig-lehnert.de", "mx-host": ["mx.ludwig-lehnert.de"]},
+    "summary": {"total-successful-session-count": 12, "total-failure-session-count": 1},
+    "failure-details": [{"result-type": "certificate-host-mismatch", "sending-mta-ip": "203.0.113.1", "receiving-mx-hostname": "mx.ludwig-lehnert.de", "failed-session-count": 1}]
+  }]
+}`
 
 func testPaths(dir string) Paths {
 	return Paths{
