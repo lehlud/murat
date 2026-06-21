@@ -363,7 +363,7 @@ func (s *Store) MessagesAll(includeSpam, includeSent bool) []*Message {
 	s.mu.RLock()
 	out := make([]*Message, 0, len(s.index.Messages))
 	for _, msg := range s.index.Messages {
-		if msg.Trashed || (!includeSpam && msg.Spam) || (!includeSent && msg.IsSent()) || msg.RawRel == "" {
+		if msg.Trashed || (!includeSpam && msg.IsSpam()) || (!includeSent && msg.IsSent()) || msg.RawRel == "" {
 			continue
 		}
 		out = append(out, msg)
@@ -427,7 +427,7 @@ func (s *Store) Search(query string, includeSpam, includeSent, includeDrafts boo
 			continue
 		}
 		msg := s.index.Messages[key]
-		if msg == nil || msg.Trashed || (!includeSpam && msg.Spam) || (!includeSent && msg.IsSent()) || msg.RawRel == "" {
+		if msg == nil || msg.Trashed || (!includeSpam && msg.IsSpam()) || (!includeSent && msg.IsSent()) || msg.RawRel == "" {
 			continue
 		}
 		out = append(out, msg)
@@ -848,6 +848,26 @@ func (m *Message) removeTag(tag string) {
 
 func (m *Message) IsSent() bool {
 	return hasSentTag(m.Tags) || hasSentTag(m.folderTags())
+}
+
+func (m *Message) IsSpam() bool {
+	if m == nil {
+		return false
+	}
+	return m.Spam || m.hasSpamTag(m.Tags) || m.hasSpamTag(m.folderTags())
+}
+
+func (m *Message) hasSpamTag(tags []string) bool {
+	for _, box := range m.resolveMailboxInfos(tags) {
+		switch normalizedMailboxRole(box.Role) {
+		case "junk", "spam":
+			return true
+		}
+		if folderMarkerFromName(box.Name) == "spam" {
+			return true
+		}
+	}
+	return false
 }
 
 func hasSentTag(tags []string) bool {

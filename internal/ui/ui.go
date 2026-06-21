@@ -597,7 +597,7 @@ func (a *App) reload() {
 				continue
 			}
 		case "spam":
-			if !msg.Spam {
+			if !msg.IsSpam() {
 				continue
 			}
 		case "sent":
@@ -610,6 +610,10 @@ func (a *App) reload() {
 			}
 		case "today":
 			if !strings.HasPrefix(msg.ReceivedAt, time.Now().Format("2006-01-02")) {
+				continue
+			}
+		case "7 days":
+			if !messageWithinDays(msg, 7) {
 				continue
 			}
 		}
@@ -642,6 +646,23 @@ func messageInList(msg *store.Message, messages []*store.Message) bool {
 		}
 	}
 	return false
+}
+
+func messageWithinDays(msg *store.Message, days int) bool {
+	if msg == nil || days <= 0 {
+		return false
+	}
+	value := firstNonEmpty(msg.ReceivedAt, msg.SentAt)
+	if value == "" {
+		return false
+	}
+	when, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return strings.HasPrefix(value, time.Now().Format("2006-01-02"))
+	}
+	now := time.Now()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -days+1)
+	return !when.Before(start)
 }
 
 func (a *App) filteredSourceMessages() []*store.Message {
@@ -814,6 +835,8 @@ func (a *App) handleFilterAction(key string) {
 		a.setFilter("unread")
 	case "d":
 		a.setFilter("today")
+	case "7":
+		a.setFilter("7 days")
 	default:
 		a.statusError("unknown filter: " + key)
 	}
@@ -1858,20 +1881,20 @@ func (a *App) drawList(y, x, height, width int) {
 		idx := a.scroll + row
 		msg := a.messages[idx]
 		spam := " "
-		if msg.Spam {
+		if msg.IsSpam() {
 			spam = "!"
 		}
 		line, spamX := tableRowText(msg, width)
 		style := ""
 		if idx == a.selected {
 			style = styleSelected
-		} else if msg.Spam {
+		} else if msg.IsSpam() {
 			style = styleSpam
 		} else if !msg.Read {
 			style = styleUnread
 		}
 		printStyledLine(y+row, x, width, line, style)
-		if idx != a.selected && msg.Spam {
+		if idx != a.selected && msg.IsSpam() {
 			printSegment(y+row, x+spamX, max(0, width-spamX), spam, styleSpam)
 		}
 	}
@@ -2007,7 +2030,7 @@ func (a *App) shortcuts() string {
 		return "mail: r reply  R reply-all  f forward  h headers  a attach  u unread  t trash  s spam  esc back"
 	}
 	if a.actionScope == "filter" {
-		return "filter: s spam  e sent  D drafts  r read  u unread  d today  c clear  esc back"
+		return "filter: s spam  e sent  D drafts  r read  u unread  d today  7 7 days  c clear  esc back"
 	}
 	if a.actionScope == "link" {
 		return "link: enter open  c copy  esc cancel"
@@ -2733,7 +2756,7 @@ func tableRowText(msg *store.Message, width int) (string, int) {
 		attach = "@"
 	}
 	spam := " "
-	if msg.Spam {
+	if msg.IsSpam() {
 		spam = "!"
 	}
 	date := shortDate(firstNonEmpty(msg.ReceivedAt, msg.SentAt))

@@ -306,6 +306,7 @@ func TestFolderColumnResolvesMailboxIDs(t *testing.T) {
 		map[string]any{"id": "b", "name": "Archive", "role": ""},
 		map[string]any{"id": "c", "name": "2026", "parentId": "b"},
 		map[string]any{"id": "d", "name": "Gelöscht", "role": ""},
+		map[string]any{"id": "e", "name": "Junk Mail", "role": ""},
 	}
 	msg := &Message{store: s, AccountID: "acct", Tags: []string{"a"}}
 	if got := msg.FolderColumn(); got != "in" {
@@ -318,6 +319,26 @@ func TestFolderColumnResolvesMailboxIDs(t *testing.T) {
 	msg.Tags = []string{"d"}
 	if got := msg.FolderColumn(); got != "trash" {
 		t.Fatalf("deleted marker = %q", got)
+	}
+	msg.Tags = []string{"e"}
+	if got := msg.FolderColumn(); got != "spam" {
+		t.Fatalf("junk marker = %q", got)
+	}
+	if !msg.IsSpam() {
+		t.Fatal("junk mailbox should mark message as spam")
+	}
+}
+
+func TestMessagesExcludeMailboxSpam(t *testing.T) {
+	s := &Store{index: emptyIndex()}
+	s.index.Mailboxes["acct"] = []any{map[string]any{"id": "junk", "name": "Junk Mail", "role": ""}}
+	msg := &Message{Key: "m", AccountID: "acct", Tags: []string{"junk"}, RawRel: "m.eml", store: s}
+	s.index.Messages[msg.Key] = msg
+	if got := s.Messages(false); len(got) != 0 {
+		t.Fatalf("Messages(false) len = %d, want 0", len(got))
+	}
+	if got := s.Messages(true); len(got) != 1 {
+		t.Fatalf("Messages(true) len = %d, want 1", len(got))
 	}
 }
 

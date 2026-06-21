@@ -5,9 +5,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"lehnert.dev/murat/internal/pgp"
 	"lehnert.dev/murat/internal/protocol"
+	"lehnert.dev/murat/internal/store"
 )
 
 func TestComposePGPLineHidesOptionsOutsideMenu(t *testing.T) {
@@ -67,6 +69,16 @@ func TestRichPlainTextShowsLinkLabelOnly(t *testing.T) {
 	want := "Read the docs now"
 	if got != want {
 		t.Fatalf("richPlainText() = %q, want %q", got, want)
+	}
+}
+
+func TestMessageWithinDays(t *testing.T) {
+	now := time.Now().UTC()
+	if !messageWithinDays(&store.Message{ReceivedAt: now.AddDate(0, 0, -6).Format(time.RFC3339)}, 7) {
+		t.Fatal("expected message within 7 days")
+	}
+	if messageWithinDays(&store.Message{ReceivedAt: now.AddDate(0, 0, -8).Format(time.RFC3339)}, 7) {
+		t.Fatal("unexpected message older than 7 days")
 	}
 }
 
