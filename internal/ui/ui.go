@@ -124,6 +124,7 @@ type App struct {
 	error        bool
 	filter       string
 	filterQuery  string
+	filterDays   int
 	pendingURL   string
 	account      int
 	actionScope  string
@@ -612,12 +613,12 @@ func (a *App) reload() {
 			if !msg.IsDraft() {
 				continue
 			}
-		case "today":
-			if !strings.HasPrefix(msg.ReceivedAt, time.Now().Format("2006-01-02")) {
+		case "trash":
+			if !msg.Trashed {
 				continue
 			}
-		case "7 days":
-			if !messageWithinDays(msg, 7) {
+		case "days":
+			if !messageWithinDays(msg, a.filterDays) {
 				continue
 			}
 		}
@@ -653,7 +654,7 @@ func messageInList(msg *store.Message, messages []*store.Message) bool {
 }
 
 func messageWithinDays(msg *store.Message, days int) bool {
-	if msg == nil || days <= 0 {
+	if msg == nil || days < 0 {
 		return false
 	}
 	value := firstNonEmpty(msg.ReceivedAt, msg.SentAt)
@@ -662,10 +663,10 @@ func messageWithinDays(msg *store.Message, days int) bool {
 	}
 	when, err := time.Parse(time.RFC3339, value)
 	if err != nil {
-		return strings.HasPrefix(value, time.Now().Format("2006-01-02"))
+		return days == 0 && strings.HasPrefix(value, time.Now().Format("2006-01-02"))
 	}
 	now := time.Now()
-	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -days+1)
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -days)
 	return !when.Before(start)
 }
 
@@ -679,6 +680,8 @@ func (a *App) filteredSourceMessages() []*store.Message {
 		return a.store.MessagesAll(false, true)
 	case "drafts":
 		return a.store.Drafts()
+	case "trash":
+		return a.store.Trash()
 	case "search":
 		return a.store.Search(a.filterQuery, false, false, true)
 	default:
@@ -708,6 +711,7 @@ func (a *App) handle(key string) bool {
 			a.preview = nil
 			a.filter = ""
 			a.filterQuery = ""
+			a.filterDays = 0
 			a.status = ""
 			a.reload()
 			return true
@@ -826,6 +830,7 @@ func (a *App) handleFilterAction(key string) {
 	case "c":
 		a.filter = ""
 		a.filterQuery = ""
+		a.filterDays = 0
 		a.actionScope = ""
 		a.reload()
 		a.status = ""
@@ -837,14 +842,14 @@ func (a *App) handleFilterAction(key string) {
 		a.setFilter("sent")
 	case "D":
 		a.setFilter("drafts")
+	case "t":
+		a.setFilter("trash")
 	case "r":
 		a.setFilter("read")
 	case "u":
 		a.setFilter("unread")
-	case "d":
-		a.setFilter("today")
-	case "7":
-		a.setFilter("7 days")
+	case "n":
+		a.daysFilterPrompt()
 	default:
 		a.statusError("unknown filter: " + key)
 	}
@@ -891,6 +896,7 @@ func (a *App) searchPrompt() {
 	}
 	a.filter = "search"
 	a.filterQuery = query
+	a.filterDays = 0
 	a.actionScope = ""
 	a.selected = 0
 	a.scroll = 0
@@ -1114,11 +1120,57 @@ func pointInArea(x, y int, value area) bool {
 func (a *App) setFilter(filter string) {
 	a.filter = filter
 	a.filterQuery = ""
+	a.filterDays = 0
 	a.actionScope = ""
 	a.selected = 0
 	a.scroll = 0
 	a.reload()
 	a.status = fmt.Sprintf("filter: %s (%d matches)", filter, len(a.messages))
+}
+
+func (a *App) setDaysFilter(days int) {
+	if days < 0 {
+		a.statusError("days must be >= 0")
+		return
+	}
+	a.filter = "days"
+	a.filterQuery = ""
+	a.filterDays = days
+	a.actionScope = ""
+	a.selected = 0
+	a.scroll = 0
+	a.reload()
+	a.status = fmt.Sprintf("filter: %s (%d matches)", daysFilterName(days), len(a.messages))
+}
+
+func (a *App) daysFilterPrompt() {
+	value, err := a.promptLine("days (0=today)")
+	a.actionScope = ""
+	if err != nil {
+		a.statusError(err.Error())
+		return
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		a.status = ""
+		return
+	}
+	days, err := strconv.Atoi(value)
+	if err != nil || days < 0 {
+		a.statusError("days must be >= 0")
+		return
+	}
+	a.setDaysFilter(days)
+}
+
+func daysFilterName(days int) string {
+	if days == 0 {
+		return "today"
+	}
+	if days == 1 {
+		return "1 day"
+	}
+	return strconv.Itoa(days) + " days"
 }
 
 func (a *App) move(delta int) {
@@ -1612,10 +1664,6 @@ func (a *App) confirmCompose(account store.Account, draft *protocol.Draft) strin
 		}
 		switch key {
 		case "s", "enter":
-			if len(draft.Attachments) > 0 && pgpBodyProtectionEnabled(draft.PGP) {
-				notice = "ERROR: PGP encrypt/sign with file attachments not supported"
-				continue
-			}
 			a.dirty = true
 			return "send"
 		case "d":
@@ -1822,6 +1870,8 @@ func (a *App) draw() {
 		filter = "all"
 	} else if filter == "search" {
 		filter = "search " + a.filterQuery
+	} else if filter == "days" {
+		filter = daysFilterName(a.filterDays)
 	}
 	acct := "all accounts"
 	if a.account > 0 && a.account-1 < len(a.accountsList) {
@@ -2045,7 +2095,7 @@ func (a *App) shortcuts() string {
 		return "mail: r reply  R reply-all  f forward  h headers  a attach  u unread  t trash  s spam  esc back"
 	}
 	if a.actionScope == "filter" {
-		return "filter: s spam  m dmarc  e sent  D drafts  r read  u unread  d today  7 7 days  c clear  esc back"
+		return "filter: s spam  m dmarc  t trash  e sent  D drafts  r read  u unread  n days  c clear  esc back"
 	}
 	if a.actionScope == "link" {
 		return "link: enter open  c copy  esc cancel"
@@ -2743,13 +2793,6 @@ func pgpSet(value string) map[string]bool {
 		}
 	}
 	return out
-}
-
-func pgpBodyProtectionEnabled(value string) bool {
-	options := pgpSet(value)
-	return options["encrypt"] || options["encrypted"] ||
-		options["sign"] || options["signed"] ||
-		options["self-encrypt"] || options["selfencrypt"] || options["self"]
 }
 
 func yesNo(value bool) string {

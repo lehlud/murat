@@ -198,17 +198,45 @@ func SendJMAP(account store.Account, draft Draft) error {
 	if draftsID == "" {
 		return fmt.Errorf("server did not advertise Drafts mailbox")
 	}
-	emailCreate, err := jmapEmailCreate(account, session, mailAccount, draftsID, draft)
-	if err != nil {
-		return err
-	}
 	cleanup := map[string]any{"keywords/$draft": nil}
 	if sentID != "" {
 		cleanup["mailboxIds/"+draftsID] = nil
 		cleanup["mailboxIds/"+sentID] = true
 	}
+	if strings.TrimSpace(draft.RawMIME) != "" {
+		return jmapSendRaw(account, session, mailAccount, submissionAccount, draftsID, identityID, cleanup, []byte(Message(account, draft)))
+	}
+	emailCreate, err := jmapEmailCreate(account, session, mailAccount, draftsID, draft)
+	if err != nil {
+		return err
+	}
 	body := jmapRequest{Using: []string{capMail, capSubmission}, MethodCalls: [][]any{
 		{"Email/set", map[string]any{"accountId": mailAccount, "create": map[string]any{"draft": emailCreate}}, "e"},
+		{"EmailSubmission/set", map[string]any{"accountId": submissionAccount, "create": map[string]any{"submission": map[string]any{"emailId": "#draft", "identityId": identityID}}, "onSuccessUpdateEmail": map[string]any{"#submission": cleanup}}, "s"},
+	}}
+	var response jmapResponse
+	if err := httpJSON(account, "POST", session.APIURL, body, &response); err != nil {
+		return err
+	}
+	if _, err := methodArgs(response, "e"); err != nil {
+		return err
+	}
+	if _, err := methodArgs(response, "s"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func jmapSendRaw(account store.Account, session *jmapSession, mailAccount, submissionAccount, draftsID, identityID string, cleanup map[string]any, raw []byte) error {
+	if session.UploadURL == "" {
+		return fmt.Errorf("server did not advertise JMAP upload URL")
+	}
+	uploaded, err := jmapUpload(account, session.UploadURL, mailAccount, "message/rfc822", raw)
+	if err != nil {
+		return err
+	}
+	body := jmapRequest{Using: []string{capMail, capSubmission}, MethodCalls: [][]any{
+		{"Email/import", map[string]any{"accountId": mailAccount, "emails": map[string]any{"draft": map[string]any{"blobId": uploaded.BlobID, "mailboxIds": map[string]bool{draftsID: true}, "keywords": map[string]bool{"$draft": true}}}}, "e"},
 		{"EmailSubmission/set", map[string]any{"accountId": submissionAccount, "create": map[string]any{"submission": map[string]any{"emailId": "#draft", "identityId": identityID}}, "onSuccessUpdateEmail": map[string]any{"#submission": cleanup}}, "s"},
 	}}
 	var response jmapResponse

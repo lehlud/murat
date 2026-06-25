@@ -423,6 +423,18 @@ func (s *Store) Drafts() []*Message {
 	return out
 }
 
+func (s *Store) Trash() []*Message {
+	messages := s.messagesSnapshot()
+	out := make([]*Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Trashed && msg.RawRel != "" {
+			out = append(out, msg)
+		}
+	}
+	sortMessages(out)
+	return out
+}
+
 func (s *Store) Search(query string, includeSpam, includeSent, includeDrafts bool) []*Message {
 	tokens := tokenize(query)
 	if len(tokens) == 0 {

@@ -41,6 +41,15 @@ func TestMessageUsesDraftFrom(t *testing.T) {
 	}
 }
 
+func TestMessageUsesRawMIME(t *testing.T) {
+	msg := Message(store.Account{Email: "a@example.com"}, Draft{To: "b@example.com", RawMIME: "Content-Type: multipart/encrypted\n\nbody"})
+	for _, want := range []string{"From: a@example.com", "MIME-Version: 1.0", "Content-Type: multipart/encrypted\r\n\r\nbody"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message missing %q:\n%s", want, msg)
+		}
+	}
+}
+
 func TestXOAUTH2SMTPAuth(t *testing.T) {
 	mechanism, response, err := (xoauth2SMTPAuth{username: "user@example.com", accessToken: "access"}).Start(nil)
 	if err != nil {

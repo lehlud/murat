@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"mime/multipart"
 	"net/mail"
 	"os"
 	"os/exec"
@@ -498,26 +499,47 @@ func ApplyDraft(from string, draft protocol.Draft) (protocol.Draft, string, erro
 			args = append(args, "--recipient", recipient)
 		}
 	}
+	if len(draft.Attachments) > 0 {
+		entity := canonicalCRLF(protocol.MIMEEntity(draft))
+		if encrypt {
+			if sign {
+				args = append(args, "--digest-algo", "SHA256", "--sign")
+			}
+			out, err := runGPG(entity, args)
+			if err != nil {
+				return draft, "", err
+			}
+			draft.RawMIME = encryptedMIMEEntity(out)
+		} else {
+			out, err := runGPG(entity, append(args, "--digest-algo", "SHA256", "--detach-sign"))
+			if err != nil {
+				return draft, "", err
+			}
+			draft.RawMIME = signedMIMEEntity(entity, out)
+		}
+		draft.Body = ""
+		draft.Attachments = nil
+		draft.PGP = ""
+		switch {
+		case encrypt && sign:
+			status = append([]string{"encrypted", "signed"}, status...)
+		case encrypt:
+			status = append([]string{"encrypted"}, status...)
+		default:
+			status = append([]string{"signed"}, status...)
+		}
+		return draft, "pgp: " + strings.Join(status, "; "), nil
+	}
 	if sign && encrypt {
 		args = append(args, "--sign")
 	} else if sign {
 		args = append(args, "--clearsign")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gpg", args...)
-	cmd.Stdin = strings.NewReader(draft.Body)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return draft, "", fmt.Errorf("pgp: send timed out")
-		}
-		return draft, "", fmt.Errorf("pgp: send failed: %s", oneLine(stderr.String()))
+	out, err := runGPG(draft.Body, args)
+	if err != nil {
+		return draft, "", err
 	}
-	draft.Body = strings.TrimSpace(stdout.String())
+	draft.Body = out
 	draft.PGP = ""
 	switch {
 	case encrypt && sign:
@@ -528,6 +550,73 @@ func ApplyDraft(from string, draft protocol.Draft) (protocol.Draft, string, erro
 		status = append([]string{"signed"}, status...)
 	}
 	return draft, "pgp: " + strings.Join(status, "; "), nil
+}
+
+func runGPG(input string, args []string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gpg", args...)
+	cmd.Stdin = strings.NewReader(input)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("pgp: send timed out")
+		}
+		return "", fmt.Errorf("pgp: send failed: %s", oneLine(stderr.String()))
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+func signedMIMEEntity(entity, signature string) string {
+	boundary := mimeBoundary()
+	return strings.Join([]string{
+		"Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=" + boundary,
+		"",
+		"--" + boundary,
+		strings.TrimRight(canonicalCRLF(entity), "\r\n"),
+		"--" + boundary,
+		"Content-Type: application/pgp-signature; name=\"signature.asc\"",
+		"Content-Disposition: attachment; filename=\"signature.asc\"",
+		"Content-Transfer-Encoding: 7bit",
+		"",
+		strings.TrimSpace(signature),
+		"--" + boundary + "--",
+		"",
+	}, "\r\n")
+}
+
+func encryptedMIMEEntity(encrypted string) string {
+	boundary := mimeBoundary()
+	return strings.Join([]string{
+		"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=" + boundary,
+		"",
+		"--" + boundary,
+		"Content-Type: application/pgp-encrypted",
+		"",
+		"Version: 1",
+		"--" + boundary,
+		"Content-Type: application/octet-stream; name=\"encrypted.asc\"",
+		"Content-Disposition: inline; filename=\"encrypted.asc\"",
+		"Content-Transfer-Encoding: 7bit",
+		"",
+		strings.TrimSpace(encrypted),
+		"--" + boundary + "--",
+		"",
+	}, "\r\n")
+}
+
+func mimeBoundary() string {
+	var buf bytes.Buffer
+	return multipart.NewWriter(&buf).Boundary()
+}
+
+func canonicalCRLF(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	return strings.ReplaceAll(value, "\n", "\r\n")
 }
 
 func CheckAvailability(from string, draft protocol.Draft) Availability {

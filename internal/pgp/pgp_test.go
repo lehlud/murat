@@ -69,3 +69,22 @@ func TestTrustName(t *testing.T) {
 		t.Fatalf("trustName(u) = %q", got)
 	}
 }
+
+func TestSignedMIMEEntityWrapsOriginalEntity(t *testing.T) {
+	entity := "Content-Type: text/plain; charset=utf-8\r\n\r\nhello"
+	got := signedMIMEEntity(entity, "-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----")
+	for _, want := range []string{"Content-Type: multipart/signed", "protocol=\"application/pgp-signature\"", entity, "signature.asc", "-----BEGIN PGP SIGNATURE-----"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("signed MIME missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestEncryptedMIMEEntityWrapsArmoredMessage(t *testing.T) {
+	got := encryptedMIMEEntity("-----BEGIN PGP MESSAGE-----\nabc\n-----END PGP MESSAGE-----")
+	for _, want := range []string{"Content-Type: multipart/encrypted", "protocol=\"application/pgp-encrypted\"", "Version: 1", "encrypted.asc", "-----BEGIN PGP MESSAGE-----"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("encrypted MIME missing %q:\n%s", want, got)
+		}
+	}
+}

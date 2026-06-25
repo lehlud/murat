@@ -43,17 +43,6 @@ func TestToggleSelfEncryptEnablesEncrypt(t *testing.T) {
 	}
 }
 
-func TestPGPBodyProtectionEnabled(t *testing.T) {
-	for _, value := range []string{"encrypt", "sign", "self-encrypt"} {
-		if !pgpBodyProtectionEnabled(value) {
-			t.Fatalf("pgpBodyProtectionEnabled(%q) = false", value)
-		}
-	}
-	if pgpBodyProtectionEnabled("attach-pubkey") {
-		t.Fatal("attach-pubkey should not count as body protection")
-	}
-}
-
 func TestMarkdownLinks(t *testing.T) {
 	links := markdownLinks("Read [the docs](https://example.com) now")
 	if len(links) != 1 {
@@ -74,7 +63,13 @@ func TestRichPlainTextShowsLinkLabelOnly(t *testing.T) {
 
 func TestMessageWithinDays(t *testing.T) {
 	now := time.Now().UTC()
-	if !messageWithinDays(&store.Message{ReceivedAt: now.AddDate(0, 0, -6).Format(time.RFC3339)}, 7) {
+	if !messageWithinDays(&store.Message{ReceivedAt: now.Format(time.RFC3339)}, 0) {
+		t.Fatal("expected message today")
+	}
+	if messageWithinDays(&store.Message{ReceivedAt: now.AddDate(0, 0, -1).Format(time.RFC3339)}, 0) {
+		t.Fatal("unexpected message before today")
+	}
+	if !messageWithinDays(&store.Message{ReceivedAt: now.AddDate(0, 0, -7).Format(time.RFC3339)}, 7) {
 		t.Fatal("expected message within 7 days")
 	}
 	if messageWithinDays(&store.Message{ReceivedAt: now.AddDate(0, 0, -8).Format(time.RFC3339)}, 7) {

@@ -25,6 +25,7 @@ type Draft struct {
 	Subject     string
 	Body        string
 	PGP         string
+	RawMIME     string
 	Attachments []Attachment
 }
 
@@ -184,28 +185,36 @@ func hasScope(scopes []string, scope string) bool {
 }
 
 func Message(account store.Account, draft Draft) string {
+	if strings.TrimSpace(draft.RawMIME) != "" {
+		return messageWithMIME(account, draft, draft.RawMIME)
+	}
 	if len(draft.Attachments) > 0 {
-		return multipartMessage(account, draft)
+		return messageWithMIME(account, draft, MIMEEntity(draft))
+	}
+	return messageWithMIME(account, draft, MIMEEntity(draft))
+}
+
+func messageWithMIME(account store.Account, draft Draft, entity string) string {
+	entity = strings.TrimLeft(strings.ReplaceAll(entity, "\r\n", "\n"), "\n")
+	entity = strings.ReplaceAll(entity, "\n", "\r\n")
+	return strings.Join(append(messageHeaders(account, draft), ""), "\r\n") + "\r\n" + entity
+}
+
+func MIMEEntity(draft Draft) string {
+	if len(draft.Attachments) > 0 {
+		return multipartEntity(draft)
 	}
 	return strings.Join([]string{
-		"From: " + draftFrom(account, draft),
-		"To: " + draft.To,
-		"Cc: " + draft.Cc,
-		"Subject: " + draft.Subject,
-		"Date: " + time.Now().Format(time.RFC1123Z),
-		"MIME-Version: 1.0",
 		"Content-Type: text/plain; charset=utf-8",
 		"",
 		draft.Body,
 	}, "\r\n")
 }
 
-func multipartMessage(account store.Account, draft Draft) string {
+func multipartEntity(draft Draft) string {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	headers := messageHeaders(account, draft)
-	headers = append(headers, "Content-Type: multipart/mixed; boundary="+writer.Boundary())
-	body.WriteString(strings.Join(headers, "\r\n"))
+	body.WriteString("Content-Type: multipart/mixed; boundary=" + writer.Boundary())
 	body.WriteString("\r\n\r\n")
 
 	textHeader := textproto.MIMEHeader{}

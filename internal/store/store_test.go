@@ -121,6 +121,24 @@ func TestSearchIndexImportPersistRemove(t *testing.T) {
 	}
 }
 
+func TestTrashListsTrashedMessages(t *testing.T) {
+	s, err := Open(testPaths(t.TempDir()), bytes.Repeat([]byte{6}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := s.ImportRaw([]byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: trash\r\nDate: Tue, 09 Jun 2026 10:00:00 +0000\r\n\r\nbody\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg.MarkTrashed()
+	if got := s.Messages(false); len(got) != 0 {
+		t.Fatalf("Messages(false) len = %d, want 0", len(got))
+	}
+	if got := s.Trash(); len(got) != 1 || got[0].Key != msg.Key {
+		t.Fatalf("Trash() = %#v", got)
+	}
+}
+
 func TestHTMLToRichText(t *testing.T) {
 	got := htmlToRichText(`<style>no</style><p>Hello <strong>bold</strong><br><em>it</em></p><ul><li>one</li><li><span style="text-decoration: underline">two</span></li></ul>`)
 	want := "Hello **bold**\n*it*\n- one\n- __two__"
