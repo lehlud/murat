@@ -539,3 +539,24 @@ func testPaths(dir string) Paths {
 		RawDir:       filepath.Join(dir, "data", "eml"),
 	}
 }
+
+func TestImportKnownAddressesMergesIdempotently(t *testing.T) {
+	dir := t.TempDir()
+	paths := testPaths(dir)
+	s, err := Open(paths, bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ImportKnownAddresses([]KnownAddress{{Name: "Alice", Email: "Alice <ALICE@example.com>", SeenAt: "2026-06-01T00:00:00Z", Count: 2}})
+	s.ImportKnownAddresses([]KnownAddress{{Name: "Ignored", Email: "alice@example.com", SeenAt: "2026-05-01T00:00:00Z", Count: 1}})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	known := s.KnownAddresses()
+	if len(known) != 1 {
+		t.Fatalf("known = %#v", known)
+	}
+	if known[0].Email != "alice@example.com" || known[0].Name != "Alice" || known[0].Count != 2 || known[0].SeenAt != "2026-06-01T00:00:00Z" {
+		t.Fatalf("known[0] = %#v", known[0])
+	}
+}

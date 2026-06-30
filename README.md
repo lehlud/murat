@@ -94,6 +94,8 @@ murat account list
 murat account add-imap
 murat account add-exchange-online
 murat account add-jmap
+murat export BACKUP.tar.gpg
+murat import [--gpg-key KEY] BACKUP.tar.gpg
 murat sync [--account ID_OR_EMAIL] [--limit N]
 murat compose --to you@example.com
 murat list
@@ -203,4 +205,6 @@ language-servers = ["murat"]
 
 - Local store encryption depends on your `gpg` key protection and local machine security.
 - Account secrets are stored inside the encrypted account store.
+- `murat export` writes account secrets and GPG secret keys into one archive encrypted by the symmetric GPG passphrase you enter during export.
+- `murat import` imports that archive into the local GPG keyring and Murat store; pass `--gpg-key KEY` when restoring before `murat init` has created a local store key.
 - PGP operations are delegated to `gpg`; key trust and recipient availability follow your local GnuPG keyring.

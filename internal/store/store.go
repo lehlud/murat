@@ -577,6 +577,39 @@ func (s *Store) KnownAddresses() []KnownAddress {
 	return out
 }
 
+func (s *Store) ImportKnownAddresses(addresses []KnownAddress) {
+	s.mu.Lock()
+	changed := false
+	for _, addr := range addresses {
+		email := normalizeEmail(addr.Email)
+		if email == "" {
+			continue
+		}
+		current := s.index.KnownAddresses[email]
+		if current.Email == "" {
+			current.Email = email
+			changed = true
+		}
+		if strings.TrimSpace(current.Name) == "" && strings.TrimSpace(addr.Name) != "" {
+			current.Name = strings.TrimSpace(addr.Name)
+			changed = true
+		}
+		if addr.SeenAt > current.SeenAt {
+			current.SeenAt = addr.SeenAt
+			changed = true
+		}
+		if addr.Count > current.Count {
+			current.Count = addr.Count
+			changed = true
+		}
+		s.index.KnownAddresses[email] = current
+	}
+	s.mu.Unlock()
+	if changed {
+		s.MarkDirty()
+	}
+}
+
 func (s *Store) RememberAddressStrings(values ...string) {
 	s.mu.Lock()
 	for _, value := range values {

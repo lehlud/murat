@@ -39,6 +39,10 @@ func Main(args []string) error {
 		return cmdInit(args[1:])
 	case "account":
 		return cmdAccount(args[1:])
+	case "export":
+		return cmdExport(args[1:])
+	case "import":
+		return cmdImportArchive(args[1:])
 	case "paths":
 		if helpRequested(args[1:]) {
 			usageSimple("paths", "print config/data paths")
@@ -96,6 +100,8 @@ func usage() {
 	fmt.Println(helpSection("Commands:"))
 	usageCommand("init", "initialize encrypted local store")
 	usageCommand("account", "manage mail accounts")
+	usageCommand("export", "export encrypted account and GPG backup")
+	usageCommand("import", "import encrypted account and GPG backup")
 	usageCommand("sync", "fetch new mail")
 	usageCommand("compose", "compose and send mail")
 	usageCommand("tui", "open fullscreen UI")
@@ -129,6 +135,10 @@ func cmdHelp(args []string) error {
 		usageSync(nil)
 	case "compose":
 		usageCompose(nil)
+	case "export":
+		usageExport(nil)
+	case "import":
+		usageImport(nil)
 	case "paths":
 		usageSimple("paths", "print config/data paths")
 	case "import-eml":
