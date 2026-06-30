@@ -31,6 +31,7 @@ var commit = "dev"
 const defaultSyncLimit = 350
 
 func Main(args []string) error {
+	pgp.ActivateManagedHomeIfPresent()
 	if len(args) == 0 {
 		args = []string{"tui"}
 	}

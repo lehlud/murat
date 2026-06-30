@@ -1,6 +1,8 @@
 package pgp
 
 import (
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -86,5 +88,29 @@ func TestEncryptedMIMEEntityWrapsArmoredMessage(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("encrypted MIME missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestKeyboxdReadOnlyError(t *testing.T) {
+	err := fmt.Errorf("pgp: import keys failed: gpg: error writing keyring '[keyboxd]': Attempt to write a readonly SQL database")
+	if !keyboxdReadOnlyError(err) {
+		t.Fatal("readonly keyboxd error not detected")
+	}
+	if keyboxdReadOnlyError(fmt.Errorf("pgp: import keys failed: gpg: invalid packet")) {
+		t.Fatal("unrelated import error detected as keyboxd readonly")
+	}
+}
+
+func TestActivateManagedHomeIfPresent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("GNUPGHOME", "")
+	if err := os.MkdirAll(ManagedHome(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ActivateManagedHomeIfPresent()
+	if os.Getenv("GNUPGHOME") != ManagedHome() {
+		t.Fatalf("GNUPGHOME = %q", os.Getenv("GNUPGHOME"))
 	}
 }

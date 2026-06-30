@@ -4,10 +4,41 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
+
+func ActivateManagedHomeIfPresent() {
+	dir := ManagedHome()
+	info, err := os.Stat(dir)
+	if err == nil && info.IsDir() {
+		_ = os.Setenv("GNUPGHOME", dir)
+	}
+}
+
+func ManagedHome() string {
+	home, _ := os.UserHomeDir()
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	if dataHome == "" {
+		dataHome = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(dataHome, "murat", "gnupg")
+}
+
+func activateManagedHome() error {
+	dir := ManagedHome()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Setenv("GNUPGHOME", dir)
+}
+
+func managedHomeActive() bool {
+	return os.Getenv("GNUPGHOME") == ManagedHome()
+}
 
 func ExportAllPublicKeys() ([]byte, error) {
 	return gpgExport("export public keys", "--batch", "--yes", "--armor", "--export")
@@ -97,6 +128,23 @@ func gpgImport(action string, data []byte, args ...string) error {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil
 	}
+	err := runGPGImport(action, data, args...)
+	if err == nil {
+		return nil
+	}
+	if managedHomeActive() || !keyboxdReadOnlyError(err) {
+		return err
+	}
+	if activateErr := activateManagedHome(); activateErr != nil {
+		return err
+	}
+	if retryErr := runGPGImport(action, data, args...); retryErr != nil {
+		return fmt.Errorf("%v; managed GPG home import failed: %w", err, retryErr)
+	}
+	return nil
+}
+
+func runGPGImport(action string, data []byte, args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gpg", args...)
@@ -110,4 +158,12 @@ func gpgImport(action string, data []byte, args ...string) error {
 		return fmt.Errorf("pgp: %s failed: %s", action, oneLine(stderr.String()))
 	}
 	return nil
+}
+
+func keyboxdReadOnlyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "readonly sql database") || strings.Contains(text, "[keyboxd]") && strings.Contains(text, "read")
 }
