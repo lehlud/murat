@@ -809,9 +809,9 @@ func (a *App) handleMailAction(key string) {
 		a.reload()
 		a.status = "moved to trash"
 	case "s":
-		msg.SetSpam(!msg.Spam)
+		msg.SetSpam(!msg.IsSpam())
 		a.reload()
-		if msg.Spam {
+		if msg.IsSpam() {
 			a.status = "marked spam"
 		} else {
 			a.status = "marked not spam"
@@ -1715,19 +1715,62 @@ func (a *App) draftPGPIdentity(draft protocol.Draft) string {
 }
 
 func (a *App) attachDraftFile(draft *protocol.Draft) string {
-	path, cancelled, err := a.promptFile("attach file", userdirs.Downloads())
-	if err != nil {
-		return "ERROR: " + err.Error()
+	initial := ""
+	for {
+		path, cancelled, err := a.promptFileInitial("attach file", userdirs.Downloads(), initial)
+		if err != nil {
+			return "ERROR: " + err.Error()
+		}
+		path = strings.TrimSpace(path)
+		if cancelled || path == "" {
+			return ""
+		}
+		expanded := userdirs.Expand(path)
+		stat, err := os.Stat(expanded)
+		if err != nil {
+			return "ERROR: " + err.Error()
+		}
+		if stat.IsDir() {
+			confirmed, err := a.confirmAttachDirectory(path)
+			if err != nil {
+				return "ERROR: " + err.Error()
+			}
+			if !confirmed {
+				initial = path
+				continue
+			}
+			attachments, err := draftAttachmentsFromDirectory(expanded)
+			if err != nil {
+				return "ERROR: " + err.Error()
+			}
+			draft.Attachments = append(draft.Attachments, attachments...)
+			return fmt.Sprintf("attached %d files from %s", len(attachments), filepath.Base(expanded))
+		}
+		attachment, err := draftAttachmentFromPath(expanded)
+		if err != nil {
+			return "ERROR: " + err.Error()
+		}
+		draft.Attachments = append(draft.Attachments, attachment)
+		return "attached " + attachment.Filename
 	}
-	if cancelled || strings.TrimSpace(path) == "" {
-		return ""
+}
+
+func (a *App) confirmAttachDirectory(path string) (bool, error) {
+	w, h := terminalSize()
+	prompt := "attach all files in " + path + "? y/n"
+	for {
+		printStyledLine(h-2, 0, w, prompt, styleStatus)
+		key, err := readKeyBlocking()
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(key) {
+		case "y":
+			return true, nil
+		case "n", "esc", "ctrl-c":
+			return false, nil
+		}
 	}
-	attachment, err := draftAttachmentFromPath(path)
-	if err != nil {
-		return "ERROR: " + err.Error()
-	}
-	draft.Attachments = append(draft.Attachments, attachment)
-	return "attached " + attachment.Filename
 }
 
 func detachLastDraftAttachment(draft *protocol.Draft) string {
@@ -1764,6 +1807,35 @@ func draftAttachmentFromPath(path string) (protocol.Attachment, error) {
 		contentType = "application/octet-stream"
 	}
 	return protocol.Attachment{Filename: filepath.Base(path), ContentType: contentType, Data: data}, nil
+}
+
+func draftAttachmentsFromDirectory(path string) ([]protocol.Attachment, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	attachments := []protocol.Attachment{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		attachment, err := draftAttachmentFromPath(filepath.Join(path, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		attachments = append(attachments, attachment)
+	}
+	if len(attachments) == 0 {
+		return nil, fmt.Errorf("directory has no files")
+	}
+	return attachments, nil
 }
 
 func (a *App) defaultSendAccount() (store.Account, bool) {
@@ -2442,25 +2514,30 @@ func (a *App) runEditor(path string) error {
 }
 
 func (a *App) promptLine(label string) (string, error) {
-	value, _, err := a.promptInput(label+": ", nil)
+	value, _, err := a.promptInput(label+": ", "", nil)
 	return value, err
 }
 
 func (a *App) promptPath(label, defaultValue string) (string, bool, error) {
-	return a.promptInput(label+" ["+defaultValue+"]: ", func(value string) string {
+	return a.promptInput(label+" ["+defaultValue+"]: ", "", func(value string) string {
 		return completeDirectoryPath(value, filepath.Dir(defaultValue))
 	})
 }
 
 func (a *App) promptFile(label, fallbackDir string) (string, bool, error) {
-	return a.promptInput(label+": ", func(value string) string {
+	return a.promptFileInitial(label, fallbackDir, "")
+}
+
+func (a *App) promptFileInitial(label, fallbackDir, initial string) (string, bool, error) {
+	return a.promptInput(label+": ", initial, func(value string) string {
 		return completeFilePath(value, fallbackDir)
 	})
 }
 
-func (a *App) promptInput(prompt string, complete func(string) string) (string, bool, error) {
+func (a *App) promptInput(prompt, initial string, complete func(string) string) (string, bool, error) {
 	w, h := terminalSize()
 	var value strings.Builder
+	value.WriteString(initial)
 	fmt.Print("\x1b[?25h")
 	defer func() {
 		fmt.Print("\x1b[?25l")

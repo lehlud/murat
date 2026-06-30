@@ -54,14 +54,19 @@ func SyncIMAPSWithUpdater(account store.Account, s *store.Store, limit int, prog
 			return 0, err
 		}
 	}
-	mailboxes := imapSyncMailboxes(account.IMAPMailbox)
+	folders := imapFolderSet{primary: firstNonEmptyString(account.IMAPMailbox, "INBOX")}
+	mailboxes := imapSyncMailboxes(folders.primary)
 	if listed, err := client.listMailboxes(); err == nil {
-		mailboxes = imapSyncMailboxes(account.IMAPMailbox, sentIMAPMailbox(listed))
+		folders = imapFolders(account.IMAPMailbox, listed)
+		mailboxes = imapSyncMailboxes(folders.primary, folders.sent, folders.spam, folders.trash)
+	}
+	if err := syncIMAPPending(client, account.ID, s, folders); err != nil {
+		return 0, err
 	}
 	known := s.KnownRemoteIDs(account.ID)
 	count := 0
 	for _, mailbox := range mailboxes {
-		added, err := syncIMAPMailbox(client, account.ID, s, mailbox, known, limit, progress)
+		added, err := syncIMAPMailbox(client, account.ID, s, mailbox, imapMailboxRole(folders, mailbox), known, limit, progress)
 		count += added
 		if err != nil {
 			return count, err
@@ -126,7 +131,7 @@ func imapUsername(account store.Account) string {
 	return strings.TrimSpace(account.Email)
 }
 
-func syncIMAPMailbox(client *IMAPClient, accountID string, s *store.Store, mailbox string, known map[string]bool, limit int, progress func(string)) (int, error) {
+func syncIMAPMailbox(client *IMAPClient, accountID string, s *store.Store, mailbox, role string, known map[string]bool, limit int, progress func(string)) (int, error) {
 	if err := client.selectMailbox(mailbox); err != nil {
 		return 0, err
 	}
@@ -135,6 +140,9 @@ func syncIMAPMailbox(client *IMAPClient, accountID string, s *store.Store, mailb
 	}
 	uids, err := client.uidSearchAll()
 	if err != nil {
+		return 0, err
+	}
+	if err := syncIMAPKnownState(client, accountID, s, mailbox, role, uids); err != nil {
 		return 0, err
 	}
 	uids = filterUnknownIMAPUIDs(uids, mailbox, known, limit)
@@ -156,8 +164,8 @@ func syncIMAPMailbox(client *IMAPClient, accountID string, s *store.Store, mailb
 			return count, err
 		}
 		msg.SetRemote(accountID, remoteID)
-		msg.SetRead(strings.Contains(strings.ToLower(flags), "\\seen"))
-		msg.SetTags([]string{mailbox})
+		msg.SetReadSynced(imapFlagsSeen(flags))
+		msg.SetFolderSynced([]string{mailbox}, role == "spam", role == "trash")
 		known[remoteID] = true
 		count++
 	}
@@ -185,9 +193,187 @@ func imapSyncMailboxes(primary string, extras ...string) []string {
 	return out
 }
 
+type imapFolderSet struct {
+	primary string
+	sent    string
+	spam    string
+	trash   string
+}
+
 type imapMailboxInfo struct {
-	name string
-	sent bool
+	name  string
+	inbox bool
+	sent  bool
+	spam  bool
+	trash bool
+}
+
+func imapFolders(primary string, boxes []imapMailboxInfo) imapFolderSet {
+	primary = strings.TrimSpace(primary)
+	if primary == "" {
+		primary = "INBOX"
+	}
+	folders := imapFolderSet{primary: primary}
+	for _, box := range boxes {
+		if folders.primary == "" && box.inbox {
+			folders.primary = box.name
+		}
+		if folders.sent == "" && box.sent {
+			folders.sent = box.name
+		}
+		if folders.spam == "" && box.spam {
+			folders.spam = box.name
+		}
+		if folders.trash == "" && box.trash {
+			folders.trash = box.name
+		}
+	}
+	return folders
+}
+
+func imapMailboxRole(folders imapFolderSet, mailbox string) string {
+	switch strings.ToLower(strings.TrimSpace(mailbox)) {
+	case strings.ToLower(strings.TrimSpace(folders.sent)):
+		return "sent"
+	case strings.ToLower(strings.TrimSpace(folders.spam)):
+		return "spam"
+	case strings.ToLower(strings.TrimSpace(folders.trash)):
+		return "trash"
+	default:
+		return "inbox"
+	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func syncIMAPKnownState(client *IMAPClient, accountID string, s *store.Store, mailbox, role string, uids []string) error {
+	knownUIDs := []string{}
+	for _, uid := range uids {
+		if _, ok := s.RemoteMessage(accountID, imapRemoteID(mailbox, uid)); ok {
+			knownUIDs = append(knownUIDs, uid)
+		}
+	}
+	flagsByUID, err := client.uidFetchFlags(knownUIDs)
+	if err != nil {
+		return err
+	}
+	for uid, flags := range flagsByUID {
+		msg, ok := s.RemoteMessage(accountID, imapRemoteID(mailbox, uid))
+		if !ok {
+			continue
+		}
+		seen := imapFlagsSeen(flags)
+		if msg.ReadDirty {
+			if err := client.uidStoreSeen(uid, msg.Read); err != nil {
+				return err
+			}
+			msg.ClearReadDirty()
+		} else {
+			msg.SetReadSynced(seen)
+		}
+		if !msg.FolderDirty {
+			msg.SetFolderSynced([]string{mailbox}, role == "spam", role == "trash")
+		}
+	}
+	return nil
+}
+
+func syncIMAPPending(client *IMAPClient, accountID string, s *store.Store, folders imapFolderSet) error {
+	selected := ""
+	selectMailbox := func(mailbox string) error {
+		if mailbox == "" || mailbox == selected {
+			return nil
+		}
+		if err := client.selectMailbox(mailbox); err != nil {
+			return err
+		}
+		selected = mailbox
+		return nil
+	}
+	for _, msg := range s.MessagesForAccount(accountID) {
+		if msg.RemoteID == "" && msg.IsSent() && msg.FolderDirty && folders.sent != "" {
+			raw, err := s.RawMessage(msg)
+			if err != nil {
+				return err
+			}
+			if err := client.appendMessage(folders.sent, raw, true); err != nil {
+				return err
+			}
+			msg.ClearReadDirty()
+			msg.ClearFolderDirty()
+			continue
+		}
+		mailbox, uid, ok := parseIMAPRemoteID(msg.RemoteID)
+		if !ok {
+			continue
+		}
+		if msg.ReadDirty {
+			if err := selectMailbox(mailbox); err != nil {
+				return err
+			}
+			if err := client.uidStoreSeen(uid, msg.Read); err != nil {
+				return err
+			}
+			msg.ClearReadDirty()
+		}
+		if !msg.FolderDirty {
+			continue
+		}
+		dest := desiredIMAPMailbox(msg, folders)
+		if dest == "" {
+			continue
+		}
+		if strings.EqualFold(dest, mailbox) {
+			msg.ClearFolderDirty()
+			continue
+		}
+		if err := selectMailbox(mailbox); err != nil {
+			return err
+		}
+		if err := client.uidCopy(uid, dest); err != nil {
+			return err
+		}
+		if err := client.uidStoreDeleted(uid); err != nil {
+			return err
+		}
+		if err := client.expunge(); err != nil {
+			return err
+		}
+		msg.ClearFolderDirty()
+	}
+	return nil
+}
+
+func desiredIMAPMailbox(msg *store.Message, folders imapFolderSet) string {
+	if msg.Trashed {
+		return folders.trash
+	}
+	if msg.IsSpam() {
+		return folders.spam
+	}
+	if msg.IsSent() {
+		return folders.sent
+	}
+	return folders.primary
+}
+
+func parseIMAPRemoteID(remoteID string) (string, string, bool) {
+	if !strings.HasPrefix(remoteID, "imap:") {
+		return "", "", false
+	}
+	value := strings.TrimPrefix(remoteID, "imap:")
+	i := strings.LastIndex(value, ":")
+	if i <= 0 || i == len(value)-1 {
+		return "", "", false
+	}
+	return value[:i], value[i+1:], true
 }
 
 func filterUnknownIMAPUIDs(uids []string, mailbox string, known map[string]bool, limit int) []string {
@@ -360,7 +546,13 @@ func parseIMAPListMailbox(line string) (imapMailboxInfo, bool) {
 	if !ok || strings.TrimSpace(name) == "" {
 		return imapMailboxInfo{}, false
 	}
-	return imapMailboxInfo{name: name, sent: strings.Contains(flags, `\sent`) || sentIMAPMailboxName(name)}, true
+	return imapMailboxInfo{
+		name:  name,
+		inbox: strings.Contains(flags, `\inbox`) || strings.EqualFold(imapMailboxBase(name), "inbox"),
+		sent:  strings.Contains(flags, `\sent`) || sentIMAPMailboxName(name),
+		spam:  strings.Contains(flags, `\junk`) || strings.Contains(flags, `\spam`) || spamIMAPMailboxName(name),
+		trash: strings.Contains(flags, `\trash`) || trashIMAPMailboxName(name),
+	}, true
 }
 
 func readIMAPListToken(text string) (string, string, bool) {
@@ -403,6 +595,26 @@ func sentIMAPMailbox(boxes []imapMailboxInfo) string {
 		}
 	}
 	return ""
+}
+
+func spamIMAPMailboxName(name string) bool {
+	base := strings.ToLower(imapMailboxBase(name))
+	switch base {
+	case "spam", "junk", "junk e-mail", "junk mail", "bulk mail":
+		return true
+	default:
+		return false
+	}
+}
+
+func trashIMAPMailboxName(name string) bool {
+	base := strings.ToLower(imapMailboxBase(name))
+	switch base {
+	case "trash", "bin", "deleted", "deleted items", "gelöscht", "geloescht", "gelöschte elemente", "geloeschte elemente", "gelöschte objekte", "geloeschte objekte", "papierkorb":
+		return true
+	default:
+		return false
+	}
 }
 
 func sentIMAPMailboxName(name string) bool {
@@ -478,6 +690,113 @@ func (c *IMAPClient) uidFetch(uid string) ([]byte, string, error) {
 	}
 }
 
+func (c *IMAPClient) uidFetchFlags(uids []string) (map[string]string, error) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for start := 0; start < len(uids); start += 200 {
+		end := min(start+200, len(uids))
+		lines, err := c.command("UID FETCH %s (FLAGS)", strings.Join(uids[start:end], ","))
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range lines {
+			uid, flags, ok := parseIMAPFetchFlags(line)
+			if ok {
+				out[uid] = flags
+			}
+		}
+	}
+	return out, nil
+}
+
+func parseIMAPFetchFlags(line string) (string, string, bool) {
+	upper := strings.ToUpper(line)
+	uidIndex := strings.Index(upper, "UID ")
+	flagsIndex := strings.Index(upper, "FLAGS ")
+	if !strings.HasPrefix(strings.TrimSpace(upper), "* ") || uidIndex < 0 || flagsIndex < 0 {
+		return "", "", false
+	}
+	uidRest := strings.Fields(line[uidIndex+4:])
+	if len(uidRest) == 0 {
+		return "", "", false
+	}
+	flagsStart := strings.Index(line[flagsIndex:], "(")
+	flagsEnd := strings.Index(line[flagsIndex:], ")")
+	if flagsStart < 0 || flagsEnd < flagsStart {
+		return uidRest[0], "", true
+	}
+	flags := line[flagsIndex+flagsStart : flagsIndex+flagsEnd+1]
+	return strings.Trim(uidRest[0], ")"), flags, true
+}
+
+func imapFlagsSeen(flags string) bool {
+	return strings.Contains(strings.ToLower(flags), `\seen`)
+}
+
+func (c *IMAPClient) uidStoreSeen(uid string, read bool) error {
+	op := "+FLAGS.SILENT"
+	if !read {
+		op = "-FLAGS.SILENT"
+	}
+	_, err := c.command("UID STORE %s %s (\\Seen)", uid, op)
+	return err
+}
+
+func (c *IMAPClient) uidStoreDeleted(uid string) error {
+	_, err := c.command("UID STORE %s +FLAGS.SILENT (\\Deleted)", uid)
+	return err
+}
+
+func (c *IMAPClient) uidCopy(uid, mailbox string) error {
+	_, err := c.command("UID COPY %s %s", uid, quoteIMAP(mailbox))
+	return err
+}
+
+func (c *IMAPClient) expunge() error {
+	_, err := c.command("EXPUNGE")
+	return err
+}
+
+func (c *IMAPClient) appendMessage(mailbox string, raw []byte, read bool) error {
+	raw = []byte(strings.ReplaceAll(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n", "\r\n"))
+	flags := ""
+	if read {
+		flags = " (\\Seen)"
+	}
+	tag := c.nextTag()
+	if _, err := fmt.Fprintf(c.conn, "%s APPEND %s%s {%d}\r\n", tag, quoteIMAP(mailbox), flags, len(raw)); err != nil {
+		return err
+	}
+	line, err := c.r.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(strings.TrimSpace(line), "+") {
+		return fmt.Errorf("imap append rejected: %s", strings.TrimSpace(line))
+	}
+	if _, err := c.conn.Write(raw); err != nil {
+		return err
+	}
+	if _, err := c.conn.Write([]byte("\r\n")); err != nil {
+		return err
+	}
+	for {
+		line, err := c.r.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, tag+" ") {
+			if strings.Contains(line, " OK") {
+				return nil
+			}
+			return fmt.Errorf("imap append failed: %s", line)
+		}
+	}
+}
+
 func literalSize(line string) int {
 	start := strings.LastIndex(line, "{")
 	end := strings.LastIndex(line, "}")
@@ -492,4 +811,11 @@ func quoteIMAP(value string) string {
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	value = strings.ReplaceAll(value, "\"", "\\\"")
 	return "\"" + value + "\""
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

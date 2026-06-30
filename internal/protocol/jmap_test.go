@@ -95,6 +95,33 @@ func TestJMAPEmailToEMLIncludesAttachments(t *testing.T) {
 	}
 }
 
+func TestJMAPMailboxRoles(t *testing.T) {
+	roles := jmapMailboxRoles([]map[string]any{
+		{"id": "in", "name": "Inbox", "role": "inbox"},
+		{"id": "sent", "name": "Sent Mail", "role": ""},
+		{"id": "junk", "name": "Junk Mail", "role": ""},
+		{"id": "trash", "name": "Deleted Items", "role": ""},
+	})
+	if roles.inbox != "in" || roles.sent != "sent" || roles.spam != "junk" || roles.trash != "trash" {
+		t.Fatalf("roles = %#v", roles)
+	}
+}
+
+func TestJMAPIDFromRemoteID(t *testing.T) {
+	if got := jmapIDFromRemoteID("jmap:abc"); got != "abc" {
+		t.Fatalf("jmapIDFromRemoteID() = %q", got)
+	}
+	if got := jmapIDFromRemoteID("imap:INBOX:1"); got != "" {
+		t.Fatalf("non-jmap id = %q", got)
+	}
+}
+
+func TestJMAPPatchPathEscapesMailboxID(t *testing.T) {
+	if got := jmapPatchPath("mailboxIds", "a/b~c"); got != "mailboxIds/a~1b~0c" {
+		t.Fatalf("jmapPatchPath() = %q", got)
+	}
+}
+
 func testStorePaths(dir string) store.Paths {
 	return store.Paths{
 		ConfigDir:    filepath.Join(dir, "config"),

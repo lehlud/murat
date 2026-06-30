@@ -65,8 +65,10 @@ type Message struct {
 	ReceivedAt     string   `json:"received_at,omitempty"`
 	SentAt         string   `json:"sent_at,omitempty"`
 	Read           bool     `json:"read,omitempty"`
+	ReadDirty      bool     `json:"read_dirty,omitempty"`
 	Spam           bool     `json:"spam,omitempty"`
 	Trashed        bool     `json:"trashed,omitempty"`
+	FolderDirty    bool     `json:"folder_dirty,omitempty"`
 	Tags           []string `json:"tags,omitempty"`
 	RemoteID       string   `json:"remote_id,omitempty"`
 	HasAttachment  bool     `json:"has_attachment,omitempty"`
@@ -87,7 +89,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	for _, key := range []string{"key", "account_id", "from", "to", "cc", "subject", "received_at", "sent_at", "read", "spam", "trashed", "tags", "remote_id", "has_attachment", "report_category", "report_checked", "eml_rel", "body_rel", "raw_size"} {
+	for _, key := range []string{"key", "account_id", "from", "to", "cc", "subject", "received_at", "sent_at", "read", "read_dirty", "spam", "trashed", "folder_dirty", "tags", "remote_id", "has_attachment", "report_category", "report_checked", "eml_rel", "body_rel", "raw_size"} {
 		delete(raw, key)
 	}
 	if value.RawRel == "" {
@@ -530,6 +532,21 @@ func (s *Store) KnownRemoteIDs(accountID string) map[string]bool {
 	return out
 }
 
+func (s *Store) MessagesForAccount(accountID string) []*Message {
+	messages := s.messagesSnapshot()
+	out := make([]*Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg == nil || msg.RawRel == "" || msg.IsDraft() {
+			continue
+		}
+		if accountID == "" || msg.AccountID == accountID {
+			out = append(out, msg)
+		}
+	}
+	sortMessages(out)
+	return out
+}
+
 func (s *Store) RemoteMessage(accountID, remoteID string) (*Message, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -625,8 +642,10 @@ func (s *Store) ImportRaw(raw []byte) (*Message, error) {
 			msg.AccountID = existing.AccountID
 		}
 		msg.Read = existing.Read
+		msg.ReadDirty = existing.ReadDirty
 		msg.Spam = existing.Spam
 		msg.Trashed = existing.Trashed
+		msg.FolderDirty = existing.FolderDirty
 		if existing.ReportChecked && (existing.ReportCategory != "" || msg.ReportCategory == "") {
 			msg.ReportCategory = existing.ReportCategory
 			msg.ReportChecked = existing.ReportChecked
@@ -699,6 +718,13 @@ func (s *Store) Attachments(msg *Message) ([]Attachment, error) {
 	return attachments, nil
 }
 
+func (s *Store) RawMessage(msg *Message) ([]byte, error) {
+	if msg == nil || msg.RawRel == "" {
+		return nil, fmt.Errorf("message has no raw EML")
+	}
+	return s.readEncrypted(filepath.Join(s.paths.RawDir, msg.RawRel))
+}
+
 func (s *Store) SaveAttachments(msg *Message, dir string) ([]string, error) {
 	attachments, err := s.Attachments(msg)
 	if err != nil {
@@ -733,11 +759,30 @@ func (s *Store) readBodyRel(rel string) (*Body, error) {
 
 func (m *Message) SetRead(read bool) {
 	if m.store == nil {
+		if m.Read != read {
+			m.ReadDirty = true
+		}
 		m.Read = read
 		return
 	}
 	m.store.mu.Lock()
+	if m.Read != read {
+		m.ReadDirty = true
+	}
 	m.Read = read
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func (m *Message) SetReadSynced(read bool) {
+	if m.store == nil {
+		m.Read = read
+		m.ReadDirty = false
+		return
+	}
+	m.store.mu.Lock()
+	m.Read = read
+	m.ReadDirty = false
 	m.store.mu.Unlock()
 	m.store.MarkDirty()
 }
@@ -758,10 +803,14 @@ func (m *Message) SetRemote(accountID, remoteID string) {
 func (m *Message) MarkTrashed() {
 	if m.store == nil {
 		m.Trashed = true
+		m.FolderDirty = true
 		m.addTag("trash")
 		return
 	}
 	m.store.mu.Lock()
+	if !m.Trashed {
+		m.FolderDirty = true
+	}
 	m.Trashed = true
 	m.addTag("trash")
 	m.store.updateSearchForMessageLocked(m)
@@ -770,21 +819,28 @@ func (m *Message) MarkTrashed() {
 }
 
 func (m *Message) SetSpam(spam bool) {
+	currentSpam := m.IsSpam()
 	if m.store == nil {
+		if currentSpam != spam {
+			m.FolderDirty = true
+		}
 		m.Spam = spam
 		if spam {
 			m.addTag("spam")
 		} else {
-			m.removeTag("spam")
+			m.removeSpamTags()
 		}
 		return
 	}
 	m.store.mu.Lock()
+	if currentSpam != spam {
+		m.FolderDirty = true
+	}
 	m.Spam = spam
 	if spam {
 		m.addTag("spam")
 	} else {
-		m.removeTag("spam")
+		m.removeSpamTags()
 	}
 	m.store.updateSearchForMessageLocked(m)
 	m.store.mu.Unlock()
@@ -794,12 +850,59 @@ func (m *Message) SetSpam(spam bool) {
 func (m *Message) SetTags(tags []string) {
 	clean := cleanTags(tags)
 	if m.store == nil {
+		if !equalStringSlice(m.Tags, clean) {
+			m.FolderDirty = true
+		}
 		m.Tags = clean
 		return
 	}
 	m.store.mu.Lock()
+	if !equalStringSlice(m.Tags, clean) {
+		m.FolderDirty = true
+	}
 	m.Tags = clean
 	m.store.updateSearchForMessageLocked(m)
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func (m *Message) SetFolderSynced(tags []string, spam, trashed bool) {
+	clean := cleanTags(tags)
+	if m.store == nil {
+		m.Tags = clean
+		m.Spam = spam
+		m.Trashed = trashed
+		m.FolderDirty = false
+		return
+	}
+	m.store.mu.Lock()
+	m.Tags = clean
+	m.Spam = spam
+	m.Trashed = trashed
+	m.FolderDirty = false
+	m.store.updateSearchForMessageLocked(m)
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func (m *Message) ClearReadDirty() {
+	if m.store == nil {
+		m.ReadDirty = false
+		return
+	}
+	m.store.mu.Lock()
+	m.ReadDirty = false
+	m.store.mu.Unlock()
+	m.store.MarkDirty()
+}
+
+func (m *Message) ClearFolderDirty() {
+	if m.store == nil {
+		m.FolderDirty = false
+		return
+	}
+	m.store.mu.Lock()
+	m.FolderDirty = false
 	m.store.mu.Unlock()
 	m.store.MarkDirty()
 }
@@ -901,6 +1004,17 @@ func (m *Message) removeTag(tag string) {
 		if current != tag {
 			kept = append(kept, current)
 		}
+	}
+	m.Tags = kept
+}
+
+func (m *Message) removeSpamTags() {
+	kept := m.Tags[:0]
+	for _, current := range m.Tags {
+		if strings.EqualFold(strings.TrimSpace(current), "spam") || m.hasSpamTag([]string{current}) {
+			continue
+		}
+		kept = append(kept, current)
 	}
 	m.Tags = kept
 }

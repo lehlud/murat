@@ -24,8 +24,8 @@ func TestFilterUnknownIMAPUIDsDeltaOnly(t *testing.T) {
 }
 
 func TestIMAPSyncMailboxesAddsSent(t *testing.T) {
-	got := imapSyncMailboxes("INBOX", "Sent")
-	want := []string{"INBOX", "Sent"}
+	got := imapSyncMailboxes("INBOX", "Sent", "Junk Mail", "Trash")
+	want := []string{"INBOX", "Sent", "Junk Mail", "Trash"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("imapSyncMailboxes() = %v, want %v", got, want)
 	}
@@ -46,6 +46,31 @@ func TestParseIMAPListMailboxDetectsSentFlag(t *testing.T) {
 	}
 	if box.name != "Gesendet" || !box.sent {
 		t.Fatalf("mailbox = %#v", box)
+	}
+}
+
+func TestParseIMAPListMailboxDetectsSpamAndTrash(t *testing.T) {
+	spam, ok := parseIMAPListMailbox(`* LIST (\HasNoChildren \Junk) "/" "Junk Mail"`)
+	if !ok || !spam.spam {
+		t.Fatalf("spam mailbox = %#v ok=%v", spam, ok)
+	}
+	trash, ok := parseIMAPListMailbox(`* LIST (\HasNoChildren) "/" "Deleted Items"`)
+	if !ok || !trash.trash {
+		t.Fatalf("trash mailbox = %#v ok=%v", trash, ok)
+	}
+}
+
+func TestIMAPFoldersUsesSpecialMailboxes(t *testing.T) {
+	folders := imapFolders("INBOX", []imapMailboxInfo{{name: "Sent", sent: true}, {name: "Junk", spam: true}, {name: "Trash", trash: true}})
+	if folders.primary != "INBOX" || folders.sent != "Sent" || folders.spam != "Junk" || folders.trash != "Trash" {
+		t.Fatalf("folders = %#v", folders)
+	}
+}
+
+func TestParseIMAPFetchFlags(t *testing.T) {
+	uid, flags, ok := parseIMAPFetchFlags(`* 1 FETCH (FLAGS (\Seen \Answered) UID 42)`)
+	if !ok || uid != "42" || !imapFlagsSeen(flags) {
+		t.Fatalf("uid=%q flags=%q ok=%v", uid, flags, ok)
 	}
 }
 

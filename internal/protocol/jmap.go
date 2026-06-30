@@ -68,6 +68,10 @@ func SyncJMAP(account store.Account, s *store.Store, limit int, progress func(st
 	if len(mailboxes) > 0 {
 		s.SetMailboxes(account.ID, mailboxes)
 	}
+	roles := jmapMailboxRoles(mailboxes)
+	if err := syncJMAPLocal(account, session.APIURL, mailAccount, roles, s); err != nil {
+		return 0, err
+	}
 	if progress != nil {
 		progress("checking messages")
 	}
@@ -76,6 +80,9 @@ func SyncJMAP(account store.Account, s *store.Store, limit int, progress func(st
 		return 0, err
 	}
 	known := s.KnownRemoteIDs(account.ID)
+	if err := syncJMAPRemoteState(account, session.APIURL, mailAccount, account.ID, s, ids, roles); err != nil {
+		return 0, err
+	}
 	ids = jmapFetchIDs(ids, account.ID, s, known, limit)
 	if progress != nil {
 		progress(fmt.Sprintf("%d messages to fetch", len(ids)))
@@ -109,19 +116,22 @@ func SyncJMAP(account store.Account, s *store.Store, limit int, progress func(st
 			return 0, err
 		}
 		msg.SetRemote(account.ID, remoteID)
+		read := jmapRead(item)
+		tags := jmapTags(item)
+		spam, trashed := jmapFolderState(tags, roles)
 		if replaceExisting {
-			msg.SetRead(existing.Read)
-			msg.SetSpam(existing.Spam)
-			if existing.Trashed {
-				msg.MarkTrashed()
+			if !existing.ReadDirty {
+				msg.SetReadSynced(read)
 			}
-			msg.SetTags(existing.Tags)
+			if !existing.FolderDirty {
+				msg.SetFolderSynced(tags, spam, trashed)
+			}
 			if existing.Key != msg.Key {
 				_ = s.RemoveMessage(existing.Key, true)
 			}
 		} else {
-			msg.SetRead(jmapRead(item))
-			msg.SetTags(jmapTags(item))
+			msg.SetReadSynced(read)
+			msg.SetFolderSynced(tags, spam, trashed)
 		}
 		if remoteID != "" {
 			known[remoteID] = true
@@ -151,6 +161,205 @@ func jmapFetchIDs(ids []string, accountID string, s *store.Store, known map[stri
 		}
 	}
 	return out
+}
+
+type jmapRoleIDs struct {
+	inbox string
+	sent  string
+	spam  string
+	trash string
+}
+
+func jmapMailboxRoles(mailboxes []map[string]any) jmapRoleIDs {
+	roles := jmapRoleIDs{}
+	for _, mailbox := range mailboxes {
+		id := stringValue(mailbox["id"])
+		if id == "" {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(stringValue(mailbox["role"])))
+		if role == "" {
+			role = jmapMailboxNameRole(stringValue(mailbox["name"]))
+		}
+		switch role {
+		case "inbox":
+			if roles.inbox == "" {
+				roles.inbox = id
+			}
+		case "sent":
+			if roles.sent == "" {
+				roles.sent = id
+			}
+		case "junk", "spam":
+			if roles.spam == "" {
+				roles.spam = id
+			}
+		case "trash", "deleted":
+			if roles.trash == "" {
+				roles.trash = id
+			}
+		}
+	}
+	return roles
+}
+
+func jmapMailboxNameRole(name string) string {
+	base := strings.ToLower(strings.TrimSpace(name))
+	slash := strings.LastIndexAny(base, `/\\`)
+	if slash >= 0 {
+		base = strings.TrimSpace(base[slash+1:])
+	}
+	switch base {
+	case "inbox", "posteingang":
+		return "inbox"
+	case "sent", "sent mail", "sent messages", "sent items", "sent-mail", "sentmail", "outbox", "gesendet", "gesendete elemente", "gesendete objekte":
+		return "sent"
+	case "spam", "junk", "junk e-mail", "junk mail", "bulk mail":
+		return "junk"
+	case "trash", "bin", "deleted", "deleted items", "gelöscht", "geloescht", "gelöschte elemente", "geloeschte elemente", "gelöschte objekte", "geloeschte objekte", "papierkorb":
+		return "trash"
+	default:
+		return ""
+	}
+}
+
+func syncJMAPLocal(account store.Account, apiURL, mailAccount string, roles jmapRoleIDs, s *store.Store) error {
+	for _, msg := range s.MessagesForAccount(account.ID) {
+		id := jmapIDFromRemoteID(msg.RemoteID)
+		if id == "" {
+			continue
+		}
+		updates := map[string]any{}
+		if msg.ReadDirty {
+			if msg.Read {
+				updates["keywords/$seen"] = true
+			} else {
+				updates["keywords/$seen"] = nil
+			}
+		}
+		dest, role := desiredJMAPMailbox(msg, roles)
+		if msg.FolderDirty && dest != "" {
+			for _, tag := range msg.Tags {
+				if strings.TrimSpace(tag) != "" {
+					updates[jmapPatchPath("mailboxIds", tag)] = nil
+				}
+			}
+			updates[jmapPatchPath("mailboxIds", dest)] = true
+		}
+		if len(updates) == 0 {
+			continue
+		}
+		if err := jmapUpdateEmail(account, apiURL, mailAccount, id, updates); err != nil {
+			return err
+		}
+		if msg.ReadDirty {
+			msg.ClearReadDirty()
+		}
+		if msg.FolderDirty && dest != "" {
+			msg.SetFolderSynced([]string{dest}, role == "spam", role == "trash")
+		}
+	}
+	return nil
+}
+
+func syncJMAPRemoteState(account store.Account, apiURL, mailAccount, accountID string, s *store.Store, ids []string, roles jmapRoleIDs) error {
+	state, err := jmapGetState(account, apiURL, mailAccount, ids)
+	if err != nil {
+		return err
+	}
+	for _, item := range state {
+		remoteID := jmapRemoteID(stringValue(item["id"]))
+		msg, ok := s.RemoteMessage(accountID, remoteID)
+		if !ok {
+			continue
+		}
+		if !msg.ReadDirty {
+			msg.SetReadSynced(jmapRead(item))
+		}
+		if !msg.FolderDirty {
+			tags := jmapTags(item)
+			spam, trash := jmapFolderState(tags, roles)
+			msg.SetFolderSynced(tags, spam, trash)
+		}
+	}
+	return nil
+}
+
+func jmapGetState(account store.Account, apiURL, mailAccount string, ids []string) ([]map[string]any, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	idsAny := make([]any, 0, len(ids))
+	for _, id := range ids {
+		idsAny = append(idsAny, id)
+	}
+	body := jmapRequest{Using: []string{capMail}, MethodCalls: [][]any{{"Email/get", map[string]any{"accountId": mailAccount, "ids": idsAny, "properties": []string{"id", "keywords", "mailboxIds"}}, "g"}}}
+	var response jmapResponse
+	if err := httpJSON(account, "POST", apiURL, body, &response); err != nil {
+		return nil, err
+	}
+	argsOut, err := methodArgs(response, "g")
+	if err != nil {
+		return nil, err
+	}
+	listAny, _ := argsOut["list"].([]any)
+	out := make([]map[string]any, 0, len(listAny))
+	for _, item := range listAny {
+		if value, ok := item.(map[string]any); ok {
+			out = append(out, value)
+		}
+	}
+	return out, nil
+}
+
+func jmapUpdateEmail(account store.Account, apiURL, mailAccount, id string, updates map[string]any) error {
+	body := jmapRequest{Using: []string{capMail}, MethodCalls: [][]any{{"Email/set", map[string]any{"accountId": mailAccount, "update": map[string]any{id: updates}}, "u"}}}
+	var response jmapResponse
+	if err := httpJSON(account, "POST", apiURL, body, &response); err != nil {
+		return err
+	}
+	_, err := methodArgs(response, "u")
+	return err
+}
+
+func desiredJMAPMailbox(msg *store.Message, roles jmapRoleIDs) (string, string) {
+	if msg.Trashed {
+		return roles.trash, "trash"
+	}
+	if msg.IsSpam() {
+		return roles.spam, "spam"
+	}
+	if msg.IsSent() {
+		return roles.sent, "sent"
+	}
+	return roles.inbox, "inbox"
+}
+
+func jmapFolderState(tags []string, roles jmapRoleIDs) (bool, bool) {
+	spam := false
+	trash := false
+	for _, tag := range tags {
+		if tag == roles.spam && tag != "" {
+			spam = true
+		}
+		if tag == roles.trash && tag != "" {
+			trash = true
+		}
+	}
+	return spam, trash
+}
+
+func jmapIDFromRemoteID(remoteID string) string {
+	if !strings.HasPrefix(remoteID, "jmap:") {
+		return ""
+	}
+	return strings.TrimPrefix(remoteID, "jmap:")
+}
+
+func jmapPatchPath(prefix, key string) string {
+	key = strings.ReplaceAll(key, "~", "~0")
+	key = strings.ReplaceAll(key, "/", "~1")
+	return prefix + "/" + key
 }
 
 func filterUnknownJMAPIDs(ids []string, known map[string]bool, limit int) []string {

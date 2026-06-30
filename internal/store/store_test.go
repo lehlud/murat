@@ -139,6 +139,46 @@ func TestTrashListsTrashedMessages(t *testing.T) {
 	}
 }
 
+func TestReadAndFolderDirtyState(t *testing.T) {
+	s, err := Open(testPaths(t.TempDir()), bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := s.ImportRaw([]byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: dirty\r\nDate: Tue, 09 Jun 2026 10:00:00 +0000\r\n\r\nbody\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg.SetRead(true)
+	if !msg.ReadDirty {
+		t.Fatal("SetRead should mark read dirty")
+	}
+	msg.SetReadSynced(false)
+	if msg.Read || msg.ReadDirty {
+		t.Fatalf("SetReadSynced read=%v dirty=%v", msg.Read, msg.ReadDirty)
+	}
+	msg.SetSpam(true)
+	if !msg.FolderDirty || !msg.IsSpam() {
+		t.Fatalf("SetSpam dirty=%v spam=%v", msg.FolderDirty, msg.IsSpam())
+	}
+	msg.SetFolderSynced([]string{"INBOX"}, false, false)
+	if msg.FolderDirty || msg.IsSpam() {
+		t.Fatalf("SetFolderSynced dirty=%v spam=%v", msg.FolderDirty, msg.IsSpam())
+	}
+}
+
+func TestSetSpamFalseRemovesResolvedSpamTags(t *testing.T) {
+	s := &Store{index: emptyIndex(), search: map[string][]string{}}
+	s.index.Mailboxes["acct"] = []any{map[string]any{"id": "junk", "name": "Junk Mail", "role": ""}}
+	msg := &Message{store: s, Key: "m", AccountID: "acct", Tags: []string{"junk"}}
+	if !msg.IsSpam() {
+		t.Fatal("precondition: message should resolve as spam")
+	}
+	msg.SetSpam(false)
+	if msg.IsSpam() || len(msg.Tags) != 0 || !msg.FolderDirty {
+		t.Fatalf("spam=%v tags=%v dirty=%v", msg.IsSpam(), msg.Tags, msg.FolderDirty)
+	}
+}
+
 func TestHTMLToRichText(t *testing.T) {
 	got := htmlToRichText(`<style>no</style><p>Hello <strong>bold</strong><br><em>it</em></p><ul><li>one</li><li><span style="text-decoration: underline">two</span></li></ul>`)
 	want := "Hello **bold**\n*it*\n- one\n- __two__"

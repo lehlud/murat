@@ -113,3 +113,35 @@ func TestDraftAttachmentFromPath(t *testing.T) {
 		t.Fatalf("content type = %q", attachment.ContentType)
 	}
 }
+
+func TestDraftAttachmentsFromDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	attachments, err := draftAttachmentsFromDirectory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attachments) != 2 {
+		t.Fatalf("attachments len = %d", len(attachments))
+	}
+	if attachments[0].Filename != "a.txt" || string(attachments[0].Data) != "a" {
+		t.Fatalf("attachment[0] = %#v", attachments[0])
+	}
+	if attachments[1].Filename != "b.txt" || string(attachments[1].Data) != "b" {
+		t.Fatalf("attachment[1] = %#v", attachments[1])
+	}
+}
+
+func TestDraftAttachmentsFromDirectoryRequiresFiles(t *testing.T) {
+	if _, err := draftAttachmentsFromDirectory(t.TempDir()); err == nil {
+		t.Fatal("expected empty directory error")
+	}
+}
