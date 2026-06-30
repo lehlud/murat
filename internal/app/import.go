@@ -28,13 +28,14 @@ type importSummary struct {
 }
 
 var (
-	readImportData  = gpgDecryptImportData
-	applyImportData = defaultApplyImportData
+	readImportData           = gpgDecryptImportData
+	applyImportData          = defaultApplyImportData
+	importSecretKeyRecipient = pgp.SecretKeyRecipient
 )
 
 func cmdImportArchive(args []string) error {
 	fs := commandFlagSet("import", usageImport)
-	gpgKey := fs.String("gpg-key", "", "GPG recipient used to wrap local store key if missing")
+	gpgKey := fs.String("gpg-key", "", "GPG recipient used to wrap local store key if missing; defaults to an imported secret key")
 	replaceAccounts := fs.Bool("replace-accounts", false, "replace account store instead of merging")
 	if handled, err := parseFlags(fs, args); handled || err != nil {
 		return err
@@ -183,8 +184,9 @@ func defaultApplyImportData(data exportData, options importOptions) (importSumma
 	}
 	paths := store.DefaultPaths()
 	key, keyErr := store.LoadKey(paths)
-	if keyErr != nil && strings.TrimSpace(options.GPGRecipient) == "" {
-		return summary, fmt.Errorf("not initialized: %w (run `murat init --gpg-key KEY` or pass `--gpg-key KEY`)", keyErr)
+	recipient, err := importGPGRecipient(data, options, keyErr)
+	if err != nil {
+		return summary, err
 	}
 	if err := pgp.ImportKeyData(data.PublicKeys); err != nil {
 		return summary, err
@@ -197,7 +199,7 @@ func defaultApplyImportData(data exportData, options importOptions) (importSumma
 	}
 	if keyErr != nil {
 		var err error
-		key, err = store.EnsureKey(paths, strings.TrimSpace(options.GPGRecipient))
+		key, err = store.EnsureKey(paths, recipient)
 		if err != nil {
 			return summary, err
 		}
@@ -228,6 +230,18 @@ func defaultApplyImportData(data exportData, options importOptions) (importSumma
 		return summary, err
 	}
 	return summary, nil
+}
+
+func importGPGRecipient(data exportData, options importOptions, keyErr error) (string, error) {
+	recipient := strings.TrimSpace(options.GPGRecipient)
+	if keyErr == nil || recipient != "" {
+		return recipient, nil
+	}
+	recipient, err := importSecretKeyRecipient(data.SecretKeys)
+	if err != nil {
+		return "", fmt.Errorf("not initialized: %w (export has no usable GPG secret key: %v; pass `--gpg-key KEY` to override)", keyErr, err)
+	}
+	return recipient, nil
 }
 
 func mergeImportedAccounts(existing, imported []store.Account) []store.Account {

@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"os"
 	"testing"
 	"time"
 
@@ -87,5 +88,41 @@ func TestMergeImportedAccountsReplacesByID(t *testing.T) {
 	}
 	if got[2].ID != "three" {
 		t.Fatalf("appended = %#v", got[2])
+	}
+}
+
+func TestImportGPGRecipientDefaultsToExportSecretKey(t *testing.T) {
+	oldRecipient := importSecretKeyRecipient
+	t.Cleanup(func() { importSecretKeyRecipient = oldRecipient })
+	importSecretKeyRecipient = func(data []byte) (string, error) {
+		if string(data) != "secret-key-data" {
+			t.Fatalf("secret key data = %q", data)
+		}
+		return "ABCDEF0123456789", nil
+	}
+
+	got, err := importGPGRecipient(exportData{SecretKeys: []byte("secret-key-data")}, importOptions{}, os.ErrNotExist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "ABCDEF0123456789" {
+		t.Fatalf("recipient = %q", got)
+	}
+}
+
+func TestImportGPGRecipientUsesOverride(t *testing.T) {
+	oldRecipient := importSecretKeyRecipient
+	t.Cleanup(func() { importSecretKeyRecipient = oldRecipient })
+	importSecretKeyRecipient = func([]byte) (string, error) {
+		t.Fatal("importSecretKeyRecipient should not be called")
+		return "", nil
+	}
+
+	got, err := importGPGRecipient(exportData{}, importOptions{GPGRecipient: "override@example.com"}, os.ErrNotExist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "override@example.com" {
+		t.Fatalf("recipient = %q", got)
 	}
 }
