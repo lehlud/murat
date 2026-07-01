@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 type keyFile struct {
@@ -24,8 +25,8 @@ func EnsureKey(paths Paths, gpgRecipient string) ([]byte, error) {
 	if gpgRecipient == "" {
 		return nil, fmt.Errorf("key missing: run `murat init --gpg-key KEY` or initialize Python murat first")
 	}
-	key := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+	key, err := newStoreKey()
+	if err != nil {
 		return nil, err
 	}
 	if err := paths.EnsureDirs(); err != nil {
@@ -39,6 +40,40 @@ func EnsureKey(paths Paths, gpgRecipient string) ([]byte, error) {
 		return nil, err
 	}
 	return key, nil
+}
+
+func EnsureRawKey(paths Paths) ([]byte, error) {
+	if data, err := LoadKey(paths); err == nil {
+		return data, nil
+	}
+	key, err := newStoreKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := paths.EnsureDirs(); err != nil {
+		return nil, err
+	}
+	if err := writeRawKey(paths, key); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func newStoreKey() ([]byte, error) {
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func writeRawKey(paths Paths, key []byte) error {
+	blob, err := json.Marshal(keyFile{Version: 1, Kind: "raw", Key: base64.RawURLEncoding.EncodeToString(key)})
+	if err != nil {
+		return err
+	}
+	blob = append(blob, '\n')
+	return os.WriteFile(paths.KeyFile, blob, 0o600)
 }
 
 func LoadKey(paths Paths) ([]byte, error) {
@@ -70,9 +105,11 @@ func LoadKey(paths Paths) ([]byte, error) {
 func gpgEncrypt(recipient string, data []byte) ([]byte, error) {
 	cmd := exec.Command("gpg", "--batch", "--yes", "--encrypt", "--recipient", recipient)
 	cmd.Stdin = bytesReader(data)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("gpg encrypt failed: %w", err)
+		return nil, fmt.Errorf("gpg encrypt failed: %s", gpgErrorMessage(stderr.String(), err))
 	}
 	return out, nil
 }
@@ -80,11 +117,23 @@ func gpgEncrypt(recipient string, data []byte) ([]byte, error) {
 func gpgDecrypt(data []byte) ([]byte, error) {
 	cmd := exec.Command("gpg", "--quiet", "--decrypt")
 	cmd.Stdin = bytesReader(data)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("gpg decrypt failed: %w", err)
+		return nil, fmt.Errorf("gpg decrypt failed: %s", gpgErrorMessage(stderr.String(), err))
 	}
 	return out, nil
+}
+
+func gpgErrorMessage(stderr string, err error) string {
+	stderr = strings.TrimSpace(strings.ReplaceAll(stderr, "\r", "\n"))
+	for _, line := range strings.Split(stderr, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line
+		}
+	}
+	return err.Error()
 }
 
 func bytesReader(data []byte) io.Reader { return bytes.NewReader(data) }

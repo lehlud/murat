@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -28,14 +29,13 @@ type importSummary struct {
 }
 
 var (
-	readImportData           = gpgDecryptImportData
-	applyImportData          = defaultApplyImportData
-	importSecretKeyRecipient = pgp.SecretKeyRecipient
+	readImportData  = gpgDecryptImportData
+	applyImportData = defaultApplyImportData
 )
 
 func cmdImportArchive(args []string) error {
 	fs := commandFlagSet("import", usageImport)
-	gpgKey := fs.String("gpg-key", "", "GPG recipient used to wrap local store key if missing; defaults to an imported secret key")
+	gpgKey := fs.String("gpg-key", "", "GPG recipient used to wrap local store key if missing; default fresh imports use a Murat-managed local key")
 	replaceAccounts := fs.Bool("replace-accounts", false, "replace account store instead of merging")
 	if handled, err := parseFlags(fs, args); handled || err != nil {
 		return err
@@ -65,7 +65,19 @@ func usageImport(fs *flag.FlagSet) {
 }
 
 func gpgDecryptImportData(path string) (exportData, error) {
-	cmd := exec.Command("gpg", "--quiet", "--decrypt", path)
+	passphrase, err := promptBackupPassphrase()
+	if err != nil {
+		return exportData{}, err
+	}
+	defer clearBytes(passphrase)
+	passphraseFile, cleanupPassphrase, err := passphraseFD(passphrase)
+	if err != nil {
+		return exportData{}, err
+	}
+	defer cleanupPassphrase()
+
+	cmd := exec.Command("gpg", gpgSymmetricDecryptArgs(path)...)
+	cmd.ExtraFiles = []*os.File{passphraseFile}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return exportData{}, err
@@ -88,6 +100,10 @@ func gpgDecryptImportData(path string) (exportData, error) {
 		return exportData{}, readErr
 	}
 	return data, nil
+}
+
+func gpgSymmetricDecryptArgs(path string) []string {
+	return []string{"--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "3", "--quiet", "--decrypt", path}
 }
 
 func importErrorLine(value string) string {
@@ -184,10 +200,6 @@ func defaultApplyImportData(data exportData, options importOptions) (importSumma
 	}
 	paths := store.DefaultPaths()
 	key, keyErr := store.LoadKey(paths)
-	recipient, err := importGPGRecipient(data, options, keyErr)
-	if err != nil {
-		return summary, err
-	}
 	if err := pgp.ImportKeyData(data.PublicKeys); err != nil {
 		return summary, err
 	}
@@ -199,7 +211,12 @@ func defaultApplyImportData(data exportData, options importOptions) (importSumma
 	}
 	if keyErr != nil {
 		var err error
-		key, err = store.EnsureKey(paths, recipient)
+		recipient := strings.TrimSpace(options.GPGRecipient)
+		if recipient != "" {
+			key, err = store.EnsureKey(paths, recipient)
+		} else {
+			key, err = store.EnsureRawKey(paths)
+		}
 		if err != nil {
 			return summary, err
 		}
@@ -230,18 +247,6 @@ func defaultApplyImportData(data exportData, options importOptions) (importSumma
 		return summary, err
 	}
 	return summary, nil
-}
-
-func importGPGRecipient(data exportData, options importOptions, keyErr error) (string, error) {
-	recipient := strings.TrimSpace(options.GPGRecipient)
-	if keyErr == nil || recipient != "" {
-		return recipient, nil
-	}
-	recipient, err := importSecretKeyRecipient(data.SecretKeys)
-	if err != nil {
-		return "", fmt.Errorf("not initialized: %w (export has no usable GPG secret key: %v; pass `--gpg-key KEY` to override)", keyErr, err)
-	}
-	return recipient, nil
 }
 
 func mergeImportedAccounts(existing, imported []store.Account) []store.Account {

@@ -2,6 +2,7 @@ package app
 
 import (
 	"archive/tar"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -37,8 +38,10 @@ type exportManifest struct {
 }
 
 var (
-	collectExportData = defaultCollectExportData
-	encryptExportData = gpgSymmetricEncryptExport
+	collectExportData         = defaultCollectExportData
+	encryptExportData         = gpgSymmetricEncryptExport
+	promptBackupPassphrase    = readBackupPassphrase
+	promptNewBackupPassphrase = readNewBackupPassphrase
 )
 
 func cmdExport(args []string) error {
@@ -133,6 +136,12 @@ func defaultCollectExportData() (exportData, error) {
 }
 
 func gpgSymmetricEncryptExport(output string, force bool, data exportData) error {
+	passphrase, err := promptNewBackupPassphrase()
+	if err != nil {
+		return err
+	}
+	defer clearBytes(passphrase)
+
 	dir := filepath.Dir(output)
 	base := filepath.Base(output)
 	tmp, err := os.CreateTemp(dir, "."+base+".*.tmp")
@@ -146,9 +155,16 @@ func gpgSymmetricEncryptExport(output string, force bool, data exportData) error
 	}
 	defer os.Remove(tmpPath)
 
-	cmd := exec.Command("gpg", "--yes", "--symmetric", "--cipher-algo", "AES256", "--output", tmpPath)
+	passphraseFile, cleanupPassphrase, err := passphraseFD(passphrase)
+	if err != nil {
+		return err
+	}
+	defer cleanupPassphrase()
+
+	cmd := exec.Command("gpg", gpgSymmetricEncryptArgs(tmpPath)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.ExtraFiles = []*os.File{passphraseFile}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -173,6 +189,10 @@ func gpgSymmetricEncryptExport(output string, force bool, data exportData) error
 		return err
 	}
 	return installEncryptedExport(tmpPath, output, force)
+}
+
+func gpgSymmetricEncryptArgs(output string) []string {
+	return []string{"--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "3", "--symmetric", "--cipher-algo", "AES256", "--output", output}
 }
 
 func installEncryptedExport(tmpPath, output string, force bool) error {
@@ -280,4 +300,40 @@ func writeTarFile(tw *tar.Writer, name string, data []byte, mode int64, now time
 	}
 	_, err := tw.Write(data)
 	return err
+}
+
+func passphraseFD(passphrase []byte) (*os.File, func(), error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	buf := append([]byte(nil), passphrase...)
+	buf = append(buf, '\n')
+	clear := func() {
+		clearBytes(buf)
+		_ = r.Close()
+	}
+	if _, err := w.Write(buf); err != nil {
+		_ = w.Close()
+		clear()
+		return nil, func() {}, err
+	}
+	if err := w.Close(); err != nil {
+		clear()
+		return nil, func() {}, err
+	}
+	return r, clear, nil
+}
+
+func clearBytes(data []byte) {
+	for i := range data {
+		data[i] = 0
+	}
+}
+
+func validBackupPassphrase(passphrase []byte) error {
+	if len(bytes.TrimSpace(passphrase)) == 0 {
+		return fmt.Errorf("backup passphrase cannot be empty")
+	}
+	return nil
 }

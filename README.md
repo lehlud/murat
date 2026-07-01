@@ -203,8 +203,8 @@ language-servers = ["murat"]
 
 ## Security Notes
 
-- Local store encryption depends on your `gpg` key protection and local machine security.
+- Local store encryption depends on local key-file protection and local machine security; `murat init --gpg-key KEY` and `murat import --gpg-key KEY` wrap that local key with GPG.
 - Account secrets are stored inside the encrypted account store.
-- `murat export` writes account secrets and GPG secret keys into one archive encrypted by the symmetric GPG passphrase you enter during export.
-- `murat import` imports that archive into GPG and the Murat store; if the default GPG keyring rejects writes, Murat falls back to a private GPG home under its data directory.
+- `murat export` writes account secrets and GPG secret keys into one archive encrypted by the backup passphrase you enter; `murat import` prompts for the same passphrase.
+- `murat import` imports that archive into GPG and the Murat store; fresh imports create a Murat-managed local store key by default, while `--gpg-key KEY` opts into GPG-wrapping that local key. If the default GPG keyring rejects writes, Murat falls back to a private GPG home under its data directory.
 - PGP operations are delegated to `gpg`; key trust and recipient availability follow your local GnuPG keyring.

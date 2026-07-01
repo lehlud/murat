@@ -138,6 +138,30 @@ func TestCmdExportPassesDataToEncryptor(t *testing.T) {
 	}
 }
 
+func TestGPGSymmetricEncryptArgsUseLoopbackPassphraseFD(t *testing.T) {
+	args := strings.Join(gpgSymmetricEncryptArgs("out.gpg"), " ")
+	for _, want := range []string{"--pinentry-mode loopback", "--passphrase-fd 3", "--symmetric", "--cipher-algo AES256", "--output out.gpg"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("args %q missing %q", args, want)
+		}
+	}
+}
+
+func TestPassphraseFDWritesPassphraseWithNewline(t *testing.T) {
+	r, cleanup, err := passphraseFD([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "secret\n" {
+		t.Fatalf("passphrase pipe = %q", got)
+	}
+}
+
 func readTarFiles(t *testing.T, data []byte) map[string][]byte {
 	t.Helper()
 	tr := tar.NewReader(bytes.NewReader(data))
