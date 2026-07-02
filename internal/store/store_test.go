@@ -318,6 +318,60 @@ func TestKnownRemoteIDs(t *testing.T) {
 	}
 }
 
+func TestParseRawMultipartSignedExtractsBody(t *testing.T) {
+	raw := []byte(signedMultipartMessage(false))
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "hello signed" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestParseRawLegacyEmbeddedMultipartSignedExtractsBody(t *testing.T) {
+	raw := []byte(signedMultipartMessage(true))
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "hello signed" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func signedMultipartMessage(legacyEmbedded bool) string {
+	entity := strings.Join([]string{
+		`Content-Type: multipart/signed; protocol="application/pgp-signature"; micalg=pgp-sha256; boundary=sig`,
+		"",
+		"--sig",
+		`Content-Type: multipart/mixed; boundary=mix`,
+		"",
+		"--mix",
+		"Content-Type: text/plain; charset=utf-8",
+		"",
+		"hello signed",
+		"--mix--",
+		"--sig",
+		`Content-Type: application/pgp-signature; name="signature.asc"`,
+		`Content-Disposition: attachment; filename="signature.asc"`,
+		"",
+		"signature",
+		"--sig--",
+		"",
+	}, "\r\n")
+	headers := strings.Join([]string{
+		"From: a@example.com",
+		"To: b@example.com",
+		"Subject: signed",
+		"Date: Tue, 09 Jun 2026 10:00:00 +0000",
+	}, "\r\n")
+	if legacyEmbedded {
+		return headers + "\r\nMIME-Version: 1.0\r\n\r\n" + entity
+	}
+	return headers + "\r\n" + entity
+}
+
 func TestImportSentMarksMessageSent(t *testing.T) {
 	dir := t.TempDir()
 	paths := testPaths(dir)

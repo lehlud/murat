@@ -195,9 +195,31 @@ func Message(account store.Account, draft Draft) string {
 }
 
 func messageWithMIME(account store.Account, draft Draft, entity string) string {
-	entity = strings.TrimLeft(strings.ReplaceAll(entity, "\r\n", "\n"), "\n")
-	entity = strings.ReplaceAll(entity, "\n", "\r\n")
-	return strings.Join(append(messageHeaders(account, draft), ""), "\r\n") + "\r\n" + entity
+	entity = normalizeMIMEEntity(entity)
+	entityHeaders, entityBody := splitMIMEEntity(entity)
+	headers := append([]string(nil), messageHeaders(account, draft)...)
+	headers = append(headers, entityHeaders...)
+	return strings.Join(headers, "\r\n") + "\r\n\r\n" + strings.ReplaceAll(entityBody, "\n", "\r\n")
+}
+
+func normalizeMIMEEntity(entity string) string {
+	entity = strings.ReplaceAll(entity, "\r\n", "\n")
+	entity = strings.ReplaceAll(entity, "\r", "\n")
+	return strings.TrimLeft(entity, "\n")
+}
+
+func splitMIMEEntity(entity string) ([]string, string) {
+	head, body, ok := strings.Cut(entity, "\n\n")
+	if !ok {
+		return nil, entity
+	}
+	headers := []string{}
+	for _, line := range strings.Split(head, "\n") {
+		if strings.TrimSpace(line) != "" {
+			headers = append(headers, line)
+		}
+	}
+	return headers, body
 }
 
 func MIMEEntity(draft Draft) string {

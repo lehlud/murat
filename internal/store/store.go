@@ -1709,7 +1709,34 @@ func extractMailText(header mail.Header, body io.Reader) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
+	if strings.TrimSpace(contentType) == "" {
+		if text, hasAttachment, ok, err := extractEmbeddedMIMEText(data); ok || err != nil {
+			return text, hasAttachment, err
+		}
+	}
 	return decodeTextBody(data, params["charset"], mediaType), false, nil
+}
+
+func extractEmbeddedMIMEText(data []byte) (string, bool, bool, error) {
+	trimmed := bytes.TrimLeft(data, "\xef\xbb\xbf \t\r\n")
+	if !startsWithMIMEHeader(trimmed) {
+		return "", false, false, nil
+	}
+	msg, err := mail.ReadMessage(bytes.NewReader(trimmed))
+	if err != nil {
+		return "", false, false, nil
+	}
+	if strings.TrimSpace(msg.Header.Get("Content-Type")) == "" {
+		return "", false, false, nil
+	}
+	text, hasAttachment, err := extractMailText(msg.Header, msg.Body)
+	return text, hasAttachment, true, err
+}
+
+func startsWithMIMEHeader(data []byte) bool {
+	line, _, _ := bytes.Cut(data, []byte("\n"))
+	line = bytes.TrimSpace(line)
+	return bytes.HasPrefix(bytes.ToLower(line), []byte("content-type:"))
 }
 
 func extractMultipart(reader *multipart.Reader) (string, string, bool, error) {

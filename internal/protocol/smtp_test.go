@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"io"
+	"net/mail"
 	"strings"
 	"testing"
 
@@ -31,6 +33,37 @@ func TestMultipartMessageIncludesAttachment(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("message missing %q:\n%s", want, msg)
 		}
+	}
+}
+
+func TestMessagePromotesMIMEEntityHeaders(t *testing.T) {
+	cases := []struct {
+		name            string
+		draft           Draft
+		wantContentType string
+	}{
+		{name: "plain", draft: Draft{To: "b@example.com", Body: "hello"}, wantContentType: "text/plain"},
+		{name: "attachment", draft: Draft{To: "b@example.com", Body: "hello", Attachments: []Attachment{{Filename: "a.txt", ContentType: "text/plain", Data: []byte("attachment")}}}, wantContentType: "multipart/mixed"},
+		{name: "raw", draft: Draft{To: "b@example.com", RawMIME: "Content-Type: multipart/encrypted; boundary=x\n\n--x--\n"}, wantContentType: "multipart/encrypted"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := Message(store.Account{Email: "a@example.com"}, tc.draft)
+			parsed, err := mail.ReadMessage(strings.NewReader(msg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.ToLower(parsed.Header.Get("Content-Type")); !strings.HasPrefix(got, tc.wantContentType) {
+				t.Fatalf("Content-Type = %q, want prefix %q\n%s", got, tc.wantContentType, msg)
+			}
+			body, err := io.ReadAll(parsed.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(string(body), "Content-Type:") {
+				t.Fatalf("body starts with MIME header:\n%s", msg)
+			}
+		})
 	}
 }
 

@@ -43,6 +43,19 @@ func TestToggleSelfEncryptEnablesEncrypt(t *testing.T) {
 	}
 }
 
+func TestSecretBufferHelpers(t *testing.T) {
+	value, chars := removeLastSecretRune([]byte("abc"), 3)
+	if string(value) != "ab" || chars != 2 {
+		t.Fatalf("removeLastSecretRune = %q, %d", value, chars)
+	}
+	clearSecretBytes(value)
+	for _, b := range value {
+		if b != 0 {
+			t.Fatalf("secret byte not cleared: %#v", value)
+		}
+	}
+}
+
 func TestMarkdownLinks(t *testing.T) {
 	links := markdownLinks("Read [the docs](https://example.com) now")
 	if len(links) != 1 {

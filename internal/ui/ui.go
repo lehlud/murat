@@ -1398,16 +1398,16 @@ func (a *App) compose(source *store.Message, replyAll bool, forward bool) {
 }
 
 func (a *App) sendDraft(account store.Account, parsed protocol.Draft) {
+	a.status = "preparing PGP..."
+	prepared, pgpStatus, ok := a.prepareDraftPGP(parsed)
+	if !ok {
+		return
+	}
 	a.status = "sending..."
-	go func(account store.Account, parsed protocol.Draft) {
+	go func(account store.Account, parsed protocol.Draft, pgpStatus string) {
 		defer a.reportPanic()
-		pgpStatus := ""
-		parsed, pgpStatus, err := pgp.ApplyDraft(a.draftPGPIdentity(parsed), parsed)
-		if err != nil {
-			a.events <- event{status: err.Error(), error: true}
-			return
-		}
 		accountsChanged := false
+		var err error
 		if account.Protocol == "jmap" {
 			err = protocol.SendJMAP(account, parsed)
 		} else {
@@ -1431,7 +1431,58 @@ func (a *App) sendDraft(account store.Account, parsed protocol.Draft) {
 		} else {
 			a.events <- event{status: "sent", accountsChanged: accountsChanged}
 		}
-	}(account, parsed)
+	}(account, prepared, pgpStatus)
+}
+
+func (a *App) prepareDraftPGP(parsed protocol.Draft) (protocol.Draft, string, bool) {
+	identity := a.draftPGPIdentity(parsed)
+	if !pgp.DraftNeedsSigning(parsed) {
+		prepared, status, err := pgp.ApplyDraft(identity, parsed)
+		if err != nil {
+			a.statusError(err.Error())
+			return parsed, "", false
+		}
+		return prepared, status, true
+	}
+	needsPassphrase, err := pgp.SigningNeedsPassphrase(identity)
+	if err != nil {
+		a.statusError(err.Error())
+		return parsed, "", false
+	}
+	if !needsPassphrase {
+		prepared, status, err := pgp.ApplyDraftWithOptions(identity, parsed, pgp.ApplyDraftOptions{LoopbackPinentry: true})
+		if err == nil {
+			return prepared, status, true
+		}
+		if !pgp.IsPassphraseRequired(err) {
+			a.statusError(err.Error())
+			return parsed, "", false
+		}
+	}
+	prompt := "GPG passphrase"
+	for {
+		passphrase, cancelled, err := a.promptSecret(prompt)
+		if err != nil {
+			a.statusError(err.Error())
+			return parsed, "", false
+		}
+		if cancelled {
+			a.status = "send cancelled"
+			a.error = false
+			return parsed, "", false
+		}
+		prepared, status, err := pgp.ApplyDraftWithOptions(identity, parsed, pgp.ApplyDraftOptions{LoopbackPinentry: true, Passphrase: passphrase})
+		clearSecretBytes(passphrase)
+		if err == nil {
+			return prepared, status, true
+		}
+		if pgp.IsPassphraseRequired(err) {
+			prompt = "GPG passphrase (try again)"
+			continue
+		}
+		a.statusError(err.Error())
+		return parsed, "", false
+	}
 }
 
 func (a *App) attachmentMenu(msg *store.Message) {
@@ -2532,6 +2583,65 @@ func (a *App) promptFileInitial(label, fallbackDir, initial string) (string, boo
 	return a.promptInput(label+": ", initial, func(value string) string {
 		return completeFilePath(value, fallbackDir)
 	})
+}
+
+func (a *App) promptSecret(label string) ([]byte, bool, error) {
+	return a.promptSecretInput(label + ": ")
+}
+
+func (a *App) promptSecretInput(prompt string) ([]byte, bool, error) {
+	w, h := terminalSize()
+	value := []byte{}
+	chars := 0
+	fmt.Print("\x1b[?25h")
+	defer func() {
+		clearSecretBytes(value)
+		fmt.Print("\x1b[?25l")
+		a.dirty = true
+	}()
+	for {
+		mask := strings.Repeat("*", chars)
+		printStyledLine(h-2, 0, w, prompt+mask, styleStatus)
+		fmt.Printf("\x1b[%d;%dH", h-1, min(w, displayLen(prompt)+chars)+1)
+		key, err := readKeyBlocking()
+		if err != nil {
+			return nil, false, err
+		}
+		switch key {
+		case "enter":
+			out := append([]byte(nil), value...)
+			return out, false, nil
+		case "esc", "ctrl-c":
+			return nil, true, nil
+		case "backspace", "delete":
+			value, chars = removeLastSecretRune(value, chars)
+		case "space":
+			value = append(value, ' ')
+			chars++
+		default:
+			if len(key) == 1 && key[0] >= 32 && key[0] != 127 {
+				value = append(value, key[0])
+				chars++
+			}
+		}
+	}
+}
+
+func removeLastSecretRune(value []byte, chars int) ([]byte, int) {
+	if len(value) == 0 {
+		return value, chars
+	}
+	value = value[:len(value)-1]
+	if chars > 0 {
+		chars--
+	}
+	return value, chars
+}
+
+func clearSecretBytes(data []byte) {
+	for i := range data {
+		data[i] = 0
+	}
 }
 
 func (a *App) promptInput(prompt, initial string, complete func(string) string) (string, bool, error) {

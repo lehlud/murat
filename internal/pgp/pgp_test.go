@@ -2,9 +2,12 @@ package pgp
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
+
+	"lehnert.dev/murat/internal/protocol"
 )
 
 func TestClearSignedTextExtractsBody(t *testing.T) {
@@ -89,6 +92,62 @@ func TestEncryptedMIMEEntityWrapsArmoredMessage(t *testing.T) {
 			t.Fatalf("encrypted MIME missing %q:\n%s", want, got)
 		}
 	}
+}
+
+func TestDraftNeedsSigning(t *testing.T) {
+	if !DraftNeedsSigning(protocolDraft("sign")) {
+		t.Fatal("sign option not detected")
+	}
+	if !DraftNeedsSigning(protocolDraft("encrypt,signed")) {
+		t.Fatal("signed option not detected")
+	}
+	if DraftNeedsSigning(protocolDraft("encrypt,self-encrypt")) {
+		t.Fatal("self-encrypt should not require signing passphrase prompt")
+	}
+}
+
+func TestGPGPassphraseRequired(t *testing.T) {
+	for _, value := range []string{
+		"[GNUPG:] NEED_PASSPHRASE 1 2 3",
+		"[GNUPG:] BAD_PASSPHRASE 1234",
+		"gpg: signing failed: Bad passphrase",
+		"gpg: signing failed: No passphrase given",
+	} {
+		if !gpgPassphraseRequired(value) {
+			t.Fatalf("passphrase error not detected: %q", value)
+		}
+	}
+	if gpgPassphraseRequired("gpg: skipped: No public key") {
+		t.Fatal("unrelated gpg error detected as passphrase-required")
+	}
+}
+
+func TestGPGLoopbackArgs(t *testing.T) {
+	args := strings.Join(gpgLoopbackArgs([]string{"--batch", "--sign"}), " ")
+	for _, want := range []string{"--pinentry-mode loopback", "--passphrase-fd 3", "--batch --sign"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("loopback args %q missing %q", args, want)
+		}
+	}
+}
+
+func TestGPGPassphraseFDWritesPassphraseWithNewline(t *testing.T) {
+	r, cleanup, err := gpgPassphraseFD([]byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "secret\n" {
+		t.Fatalf("passphrase fd = %q", data)
+	}
+}
+
+func protocolDraft(pgpOptions string) protocol.Draft {
+	return protocol.Draft{PGP: pgpOptions}
 }
 
 func TestKeyboxdReadOnlyError(t *testing.T) {

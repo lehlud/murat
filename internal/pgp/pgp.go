@@ -3,6 +3,7 @@ package pgp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/mail"
@@ -21,6 +22,17 @@ type Availability struct {
 	Encrypt         bool
 	SelfEncrypt     bool
 	AttachPublicKey bool
+}
+
+var ErrPassphraseRequired = errors.New("pgp: passphrase required")
+
+type ApplyDraftOptions struct {
+	LoopbackPinentry bool
+	Passphrase       []byte
+}
+
+func IsPassphraseRequired(err error) bool {
+	return errors.Is(err, ErrPassphraseRequired)
 }
 
 func ProcessText(text string) (string, string, bool) {
@@ -449,11 +461,15 @@ func firstNonEmpty(values ...string) string {
 }
 
 func ApplyDraft(from string, draft protocol.Draft) (protocol.Draft, string, error) {
-	options := ParseOptions(draft.PGP)
-	encrypt := options["encrypt"] || options["encrypted"]
-	sign := options["sign"] || options["signed"]
-	selfEncrypt := options["self-encrypt"] || options["selfencrypt"] || options["self"]
-	attachPublicKey := options["attach-pubkey"] || options["attach-public-key"] || options["pubkey"]
+	return ApplyDraftWithOptions(from, draft, ApplyDraftOptions{})
+}
+
+func ApplyDraftWithOptions(from string, draft protocol.Draft, options ApplyDraftOptions) (protocol.Draft, string, error) {
+	pgpOptions := ParseOptions(draft.PGP)
+	encrypt := pgpOptions["encrypt"] || pgpOptions["encrypted"]
+	sign := pgpOptions["sign"] || pgpOptions["signed"]
+	selfEncrypt := pgpOptions["self-encrypt"] || pgpOptions["selfencrypt"] || pgpOptions["self"]
+	attachPublicKey := pgpOptions["attach-pubkey"] || pgpOptions["attach-public-key"] || pgpOptions["pubkey"]
 	if selfEncrypt && !encrypt {
 		return draft, "", fmt.Errorf("pgp: self-encrypt needs encrypt")
 	}
@@ -505,13 +521,13 @@ func ApplyDraft(from string, draft protocol.Draft) (protocol.Draft, string, erro
 			if sign {
 				args = append(args, "--digest-algo", "SHA256", "--sign")
 			}
-			out, err := runGPG(entity, args)
+			out, err := runGPGWithOptions(entity, args, options)
 			if err != nil {
 				return draft, "", err
 			}
 			draft.RawMIME = encryptedMIMEEntity(out)
 		} else {
-			out, err := runGPG(entity, append(args, "--digest-algo", "SHA256", "--detach-sign"))
+			out, err := runGPGWithOptions(entity, append(args, "--digest-algo", "SHA256", "--detach-sign"), options)
 			if err != nil {
 				return draft, "", err
 			}
@@ -535,7 +551,7 @@ func ApplyDraft(from string, draft protocol.Draft) (protocol.Draft, string, erro
 	} else if sign {
 		args = append(args, "--clearsign")
 	}
-	out, err := runGPG(draft.Body, args)
+	out, err := runGPGWithOptions(draft.Body, args, options)
 	if err != nil {
 		return draft, "", err
 	}
@@ -553,10 +569,29 @@ func ApplyDraft(from string, draft protocol.Draft) (protocol.Draft, string, erro
 }
 
 func runGPG(input string, args []string) (string, error) {
+	return runGPGWithOptions(input, args, ApplyDraftOptions{})
+}
+
+func runGPGWithOptions(input string, args []string, options ApplyDraftOptions) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "gpg", args...)
+	cmdArgs := append([]string(nil), args...)
+	var passphraseFile *os.File
+	cleanupPassphrase := func() {}
+	if options.LoopbackPinentry {
+		cmdArgs = gpgLoopbackArgs(cmdArgs)
+		var err error
+		passphraseFile, cleanupPassphrase, err = gpgPassphraseFD(options.Passphrase)
+		if err != nil {
+			return "", err
+		}
+		defer cleanupPassphrase()
+	}
+	cmd := exec.CommandContext(ctx, "gpg", cmdArgs...)
 	cmd.Stdin = strings.NewReader(input)
+	if passphraseFile != nil {
+		cmd.ExtraFiles = []*os.File{passphraseFile}
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -565,9 +600,52 @@ func runGPG(input string, args []string) (string, error) {
 		if ctx.Err() == context.DeadlineExceeded {
 			return "", fmt.Errorf("pgp: send timed out")
 		}
+		if gpgPassphraseRequired(stderr.String()) {
+			return "", fmt.Errorf("%w: %s", ErrPassphraseRequired, oneLine(stderr.String()))
+		}
 		return "", fmt.Errorf("pgp: send failed: %s", oneLine(stderr.String()))
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+func gpgLoopbackArgs(args []string) []string {
+	out := []string{"--pinentry-mode", "loopback", "--passphrase-fd", "3"}
+	out = append(out, args...)
+	return out
+}
+
+func gpgPassphraseFD(passphrase []byte) (*os.File, func(), error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	buf := append([]byte(nil), passphrase...)
+	buf = append(buf, '\n')
+	cleanup := func() {
+		clearBytes(buf)
+		_ = r.Close()
+	}
+	if _, err := w.Write(buf); err != nil {
+		_ = w.Close()
+		cleanup()
+		return nil, func() {}, err
+	}
+	if err := w.Close(); err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	return r, cleanup, nil
+}
+
+func clearBytes(data []byte) {
+	for i := range data {
+		data[i] = 0
+	}
+}
+
+func gpgPassphraseRequired(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "need_passphrase") || strings.Contains(lower, "bad_passphrase") || strings.Contains(lower, "bad passphrase") || strings.Contains(lower, "no passphrase given") || strings.Contains(lower, "passphrase is required")
 }
 
 func signedMIMEEntity(entity, signature string) string {
@@ -617,6 +695,30 @@ func canonicalCRLF(value string) string {
 	value = strings.ReplaceAll(value, "\r\n", "\n")
 	value = strings.ReplaceAll(value, "\r", "\n")
 	return strings.ReplaceAll(value, "\n", "\r\n")
+}
+
+func DraftNeedsSigning(draft protocol.Draft) bool {
+	options := ParseOptions(draft.PGP)
+	return options["sign"] || options["signed"]
+}
+
+func SigningNeedsPassphrase(identity string) (bool, error) {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return false, fmt.Errorf("pgp: no signing identity")
+	}
+	if !HasSecretKey(identity) {
+		return false, fmt.Errorf("pgp: no secret key for %s", identity)
+	}
+	args := []string{"--batch", "--yes", "--armor", "--local-user", identity, "--detach-sign"}
+	_, err := runGPGWithOptions("murat signing probe\n", args, ApplyDraftOptions{LoopbackPinentry: true})
+	if err == nil {
+		return false, nil
+	}
+	if IsPassphraseRequired(err) {
+		return true, nil
+	}
+	return false, err
 }
 
 func CheckAvailability(from string, draft protocol.Draft) Availability {
