@@ -1053,7 +1053,10 @@ func (m *Message) removeSpamTags() {
 }
 
 func (m *Message) IsSent() bool {
-	return hasSentTag(m.Tags) || hasSentTag(m.folderTags())
+	if m == nil {
+		return false
+	}
+	return hasSentTag(m.Tags) || hasSentTag(m.folderTags()) || m.hasSentMailbox(m.Tags) || m.hasSentMailbox(m.folderTags())
 }
 
 func (m *Message) IsSpam() bool {
@@ -1070,6 +1073,18 @@ func (m *Message) hasSpamTag(tags []string) bool {
 			return true
 		}
 		if folderMarkerFromName(box.Name) == "spam" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Message) hasSentMailbox(tags []string) bool {
+	for _, box := range m.resolveMailboxInfos(tags) {
+		if normalizedMailboxRole(box.Role) == "sent" {
+			return true
+		}
+		if folderMarkerFromName(box.Name) == "out" {
 			return true
 		}
 	}

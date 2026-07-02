@@ -390,6 +390,34 @@ func TestFolderColumnResolvesMailboxIDs(t *testing.T) {
 	}
 }
 
+func TestMessagesClassifyResolvedSentMailboxes(t *testing.T) {
+	s := &Store{index: emptyIndex()}
+	s.index.Mailboxes["acct"] = []any{
+		map[string]any{"id": "sent-name", "name": "Sent Items", "role": ""},
+		map[string]any{"id": "sent-role", "name": "Archive Copy", "role": "sent"},
+	}
+
+	byName := &Message{Key: "by-name", AccountID: "acct", Tags: []string{"sent-name"}, RawRel: "by-name.eml", store: s}
+	s.index.Messages[byName.Key] = byName
+	if got := byName.FolderColumn(); got != "out" {
+		t.Fatalf("folder column = %q, want out", got)
+	}
+	if !byName.IsSent() {
+		t.Fatal("sent mailbox name should classify message as sent")
+	}
+	if got := s.Messages(false); len(got) != 0 {
+		t.Fatalf("Messages(false) len = %d, want 0", len(got))
+	}
+	if got := s.MessagesAll(false, true); len(got) != 1 || got[0].Key != byName.Key {
+		t.Fatalf("MessagesAll(false, true) = %#v", got)
+	}
+
+	byRole := &Message{Key: "by-role", AccountID: "acct", Tags: []string{"sent-role"}, RawRel: "by-role.eml", store: s}
+	if !byRole.IsSent() {
+		t.Fatal("sent mailbox role should classify message as sent")
+	}
+}
+
 func TestMessagesExcludeMailboxSpam(t *testing.T) {
 	s := &Store{index: emptyIndex()}
 	s.index.Mailboxes["acct"] = []any{map[string]any{"id": "junk", "name": "Junk Mail", "role": ""}}
