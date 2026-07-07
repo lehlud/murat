@@ -750,21 +750,21 @@ func jmapEmailToEML(account store.Account, session *jmapSession, mailAccount str
 }
 
 func jmapEmailHeaders(item map[string]any) []string {
-	date := stringValue(item["receivedAt"])
+	date := cleanHeaderValue(stringValue(item["receivedAt"]))
 	if date == "" {
-		date = stringValue(item["sentAt"])
+		date = cleanHeaderValue(stringValue(item["sentAt"]))
 	}
 	if date == "" {
 		date = time.Now().Format(time.RFC3339)
 	}
 	return []string{
-		"From: " + firstAddress(item["from"]),
-		"To: " + addresses(item["to"]),
-		"Cc: " + addresses(item["cc"]),
-		"Subject: " + stringValue(item["subject"]),
+		"From: " + cleanHeaderValue(firstAddress(item["from"])),
+		"To: " + cleanHeaderValue(addresses(item["to"])),
+		"Cc: " + cleanHeaderValue(addresses(item["cc"])),
+		"Subject: " + cleanHeaderValue(stringValue(item["subject"])),
 		"Date: " + date,
 		"MIME-Version: 1.0",
-		"X-Murat-JMAP-ID: " + stringValue(item["id"]),
+		"X-Murat-JMAP-ID: " + cleanHeaderValue(stringValue(item["id"])),
 	}
 }
 
@@ -785,7 +785,7 @@ func jmapMultipartEmail(item map[string]any, body string, attachments []jmapAtta
 		if strings.TrimSpace(name) == "" {
 			name = fmt.Sprintf("attachment-%d", i+1)
 		}
-		contentType := attachment.ContentType
+		contentType := cleanHeaderValue(attachment.ContentType)
 		if strings.TrimSpace(contentType) == "" {
 			contentType = "application/octet-stream"
 		}
@@ -839,6 +839,8 @@ func jmapAttachmentInfos(item map[string]any) []jmapAttachmentData {
 }
 
 func jmapDownload(account store.Account, templateURL, accountID, blobID, name, contentType string) ([]byte, error) {
+	name = cleanHeaderValue(name)
+	contentType = cleanHeaderValue(contentType)
 	if strings.TrimSpace(name) == "" {
 		name = "attachment"
 	}
@@ -943,8 +945,8 @@ func firstAddress(value any) string {
 
 func address(value any) string {
 	item, _ := value.(map[string]any)
-	email := stringValue(item["email"])
-	name := stringValue(item["name"])
+	email := cleanHeaderValue(stringValue(item["email"]))
+	name := cleanHeaderValue(stringValue(item["name"]))
 	if name != "" && email != "" {
 		return name + " <" + email + ">"
 	}

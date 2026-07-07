@@ -249,7 +249,7 @@ func multipartEntity(draft Draft) string {
 		if strings.TrimSpace(name) == "" {
 			name = "attachment"
 		}
-		contentType := attachment.ContentType
+		contentType := cleanHeaderValue(attachment.ContentType)
 		if strings.TrimSpace(contentType) == "" {
 			contentType = "application/octet-stream"
 		}
@@ -266,10 +266,10 @@ func multipartEntity(draft Draft) string {
 
 func messageHeaders(account store.Account, draft Draft) []string {
 	return []string{
-		"From: " + draftFrom(account, draft),
-		"To: " + draft.To,
-		"Cc: " + draft.Cc,
-		"Subject: " + draft.Subject,
+		"From: " + cleanHeaderValue(draftFrom(account, draft)),
+		"To: " + cleanHeaderValue(draft.To),
+		"Cc: " + cleanHeaderValue(draft.Cc),
+		"Subject: " + cleanHeaderValue(draft.Subject),
 		"Date: " + time.Now().Format(time.RFC1123Z),
 		"MIME-Version: 1.0",
 	}
@@ -283,7 +283,7 @@ func draftFrom(account store.Account, draft Draft) string {
 }
 
 func draftFromEmail(account store.Account, draft Draft) string {
-	from := draftFrom(account, draft)
+	from := cleanHeaderValue(draftFrom(account, draft))
 	if addr, err := mail.ParseAddress(from); err == nil {
 		return addr.Address
 	}
@@ -303,6 +303,7 @@ func writeBase64(writer interface{ Write([]byte) (int, error) }, data []byte) {
 }
 
 func escapeMIMEParam(value string) string {
+	value = cleanHeaderValue(value)
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	return strings.ReplaceAll(value, "\"", "\\\"")
 }
@@ -312,7 +313,7 @@ func recipients(draft Draft) []string {
 	out := []string{}
 	for _, value := range values {
 		for _, item := range strings.Split(value, ",") {
-			item = strings.TrimSpace(item)
+			item = cleanHeaderValue(strings.TrimSpace(item))
 			if item != "" {
 				out = append(out, item)
 			}

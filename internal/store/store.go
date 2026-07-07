@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	cryptobox "lehnert.dev/murat/internal/crypto"
+	"lehnert.dev/murat/internal/textutil"
 )
 
 type Store struct {
@@ -1578,9 +1579,9 @@ func decodeHeader(value string) string {
 	decoder := mime.WordDecoder{CharsetReader: charsetReader}
 	decoded, err := decoder.DecodeHeader(value)
 	if err != nil {
-		return value
+		return textutil.CleanHeaderValue(value)
 	}
-	return decoded
+	return textutil.CleanHeaderValue(decoded)
 }
 
 func charsetReader(charset string, input io.Reader) (io.Reader, error) {
@@ -1592,10 +1593,10 @@ func charsetReader(charset string, input io.Reader) (io.Reader, error) {
 }
 
 func remoteIDFromHeader(header mail.Header) string {
-	if value := strings.TrimSpace(header.Get("X-Murat-Remote-ID")); value != "" {
+	if value := textutil.CleanHeaderValue(header.Get("X-Murat-Remote-ID")); value != "" {
 		return value
 	}
-	if value := strings.TrimSpace(header.Get("X-Murat-JMAP-ID")); value != "" {
+	if value := textutil.CleanHeaderValue(header.Get("X-Murat-JMAP-ID")); value != "" {
 		return "jmap:" + value
 	}
 	return ""
@@ -2177,6 +2178,7 @@ func writeHTMLMarkerClose(out *strings.Builder, markers htmlMarkers) {
 }
 
 func splitAddressHeader(value string) []string {
+	value = textutil.CleanHeaderValue(value)
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}
@@ -2187,7 +2189,9 @@ func splitAddressHeader(value string) []string {
 	}
 	out := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
-		out = append(out, displayAddress(addr))
+		if display := textutil.CleanHeaderValue(displayAddress(addr)); display != "" {
+			out = append(out, display)
+		}
 	}
 	return out
 }
@@ -2197,7 +2201,7 @@ func decodeAddressHeader(value string) string {
 	if len(items) == 0 {
 		return ""
 	}
-	return strings.Join(items, ", ")
+	return textutil.CleanHeaderValue(strings.Join(items, ", "))
 }
 
 func decodeAddressHeaders(values []string) []string {

@@ -20,6 +20,7 @@ import (
 	"lehnert.dev/murat/internal/pgp"
 	"lehnert.dev/murat/internal/protocol"
 	"lehnert.dev/murat/internal/store"
+	"lehnert.dev/murat/internal/textutil"
 	"lehnert.dev/murat/internal/userdirs"
 )
 
@@ -2991,7 +2992,7 @@ func yesNo(value bool) string {
 
 func tableRowText(msg *store.Message, width int) (string, int) {
 	folderWidth := 10
-	folder := padRight(shorten(msg.FolderColumn(), folderWidth), folderWidth)
+	folder := padRight(shorten(textutil.CleanHeaderValue(msg.FolderColumn()), folderWidth), folderWidth)
 	marker := " "
 	if !msg.Read {
 		marker = "*"
@@ -3004,9 +3005,9 @@ func tableRowText(msg *store.Message, width int) (string, int) {
 	if msg.IsSpam() {
 		spam = "!"
 	}
-	date := shortDate(firstNonEmpty(msg.ReceivedAt, msg.SentAt))
-	sender := msg.From
-	subject := msg.Subject
+	date := textutil.CleanHeaderValue(shortDate(firstNonEmpty(msg.ReceivedAt, msg.SentAt)))
+	sender := textutil.CleanHeaderValue(msg.From)
+	subject := textutil.CleanHeaderValue(msg.Subject)
 	prefix := folder + " " + marker + attach + spam + " "
 	spamX := folderWidth + 1 + 2
 	if width < 72 {
