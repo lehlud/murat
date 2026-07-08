@@ -74,6 +74,25 @@ func TestRichPlainTextShowsLinkLabelOnly(t *testing.T) {
 	}
 }
 
+func TestWrapKeepsLongMarkdownLinkResolvable(t *testing.T) {
+	url := "https://manage.kmail-lists.com/subscriptions/unsubscribe?a=" + strings.Repeat("x", 96)
+	lines := wrap("No longer want [Unsubscribe]("+url+") now", 20)
+	for _, line := range lines {
+		links := markdownLinks(line)
+		if len(links) == 0 {
+			continue
+		}
+		if links[0].url != url {
+			t.Fatalf("url = %q, want %q", links[0].url, url)
+		}
+		if got := richPlainText(line); !strings.Contains(got, "Unsubscribe") {
+			t.Fatalf("plain wrapped line = %q", got)
+		}
+		return
+	}
+	t.Fatalf("wrapped lines contain no resolvable link: %#v", lines)
+}
+
 func TestMessageWithinDays(t *testing.T) {
 	now := time.Now().UTC()
 	if !messageWithinDays(&store.Message{ReceivedAt: now.Format(time.RFC3339)}, 0) {

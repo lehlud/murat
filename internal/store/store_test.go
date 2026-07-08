@@ -195,6 +195,30 @@ func TestHTMLToRichTextPreservesAnchors(t *testing.T) {
 	}
 }
 
+func TestDecodeMissingQuotedPrintableLinkWithoutTransferHeader(t *testing.T) {
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: qp-link\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nNo longer want to receive these emails? [Unsubscribe](https://manage.kmail-=\r\nlists.com/subscriptions/unsubscribe?a=3DVfEsBX&c=3D01KVRQCNRMHC8P3M797P1ZPP3S&se=3Dbanking%40ludwig-lehnert.de&m=\r\n=3DUmACv7).\r\n")
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "No longer want to receive these emails? [Unsubscribe](https://manage.kmail-lists.com/subscriptions/unsubscribe?a=VfEsBX&c=01KVRQCNRMHC8P3M797P1ZPP3S&se=banking%40ludwig-lehnert.de&m=UmACv7)."
+	if body != want {
+		t.Fatalf("body = %q, want %q", body, want)
+	}
+}
+
+func TestDecodeMissingQuotedPrintableMultipartHTMLLink(t *testing.T) {
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: qp-html-link\r\nContent-Type: multipart/alternative; boundary=abc\r\n\r\n--abc\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>No longer want to receive these emails? <a href=\"https://manage.kmail-=\r\nlists.com/subscriptions/unsubscribe?a=3DVfEsBX&amp;c=3D01KVRQCNRMHC8P3M797P1ZPP3S\">Unsubscribe</a>.</p>\r\n--abc--\r\n")
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "No longer want to receive these emails? [Unsubscribe](https://manage.kmail-lists.com/subscriptions/unsubscribe?a=VfEsBX&c=01KVRQCNRMHC8P3M797P1ZPP3S)."
+	if body != want {
+		t.Fatalf("body = %q, want %q", body, want)
+	}
+}
+
 func TestTextPlainHTMLDocumentWithNoTextIsEmpty(t *testing.T) {
 	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: html-empty\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\n<html>\r\n<head>\r\n<meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\">\r\n<style type=\"text/css\" style=\"display:none;\"> P {margin-top:0;margin-bottom:0;} </style>\r\n</head>\r\n<body dir=\"ltr\">\r\n<div style=\"font-family: Aptos, Calibri, sans-serif; font-size: 10pt; color: rgb(0, 0, 0);\"><br></div>\r\n</body>\r\n</html>\r\n")
 	_, body, _, err := parseRaw(raw)

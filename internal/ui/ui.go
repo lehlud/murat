@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"lehnert.dev/murat/internal/compose"
 	"lehnert.dev/murat/internal/config"
@@ -3109,18 +3110,56 @@ func wrap(text string, width int) []string {
 	}
 	out := []string{}
 	for _, raw := range strings.Split(text, "\n") {
-		line := []rune(raw)
-		if len(line) == 0 {
-			out = append(out, "")
-			continue
-		}
-		for len(line) > width {
-			out = append(out, string(line[:width]))
-			line = line[width:]
-		}
-		out = append(out, string(line))
+		out = append(out, wrapRichLine(raw, width)...)
 	}
 	return out
+}
+
+func wrapRichLine(text string, width int) []string {
+	if text == "" {
+		return []string{""}
+	}
+	out := []string{}
+	start := 0
+	col := 0
+	for i := 0; i < len(text); {
+		next, tokenWidth := richWrapToken(text, i)
+		if col > 0 && col+tokenWidth > width {
+			out = append(out, text[start:i])
+			start = i
+			col = 0
+			continue
+		}
+		if col == 0 && tokenWidth > width {
+			out = append(out, text[start:next])
+			start = next
+			i = next
+			continue
+		}
+		col += tokenWidth
+		i = next
+	}
+	if start < len(text) {
+		out = append(out, text[start:])
+	}
+	return out
+}
+
+func richWrapToken(text string, i int) (int, int) {
+	if raw, _, label, ok := markdownLinkAt(text, i); ok {
+		return i + len(raw), displayLen(richPlainText(label))
+	}
+	if strings.HasPrefix(text[i:], "**") || strings.HasPrefix(text[i:], "__") {
+		return i + 2, 0
+	}
+	if text[i] == '*' {
+		return i + 1, 0
+	}
+	_, size := utf8.DecodeRuneInString(text[i:])
+	if size <= 0 {
+		return i + 1, 1
+	}
+	return i + size, 1
 }
 
 func shortDate(value string) string {

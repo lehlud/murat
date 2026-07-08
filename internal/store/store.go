@@ -1787,18 +1787,59 @@ func extractMultipart(reader *multipart.Reader) (string, string, bool, error) {
 		case "text/plain":
 			plain = append(plain, decodeTextBody(data, params["charset"], mediaType))
 		case "text/html":
-			html = append(html, decodeBytes(data, params["charset"]))
+			html = append(html, decodeBytes(repairMissingQuotedPrintable(data), params["charset"]))
 		}
 	}
 	return strings.Join(plain, "\n\n"), strings.Join(html, "\n\n"), hasAttachment, nil
 }
 
 func decodeTextBody(data []byte, charset, mediaType string) string {
+	data = repairMissingQuotedPrintable(data)
 	text := decodeBytes(data, charset)
 	if strings.HasPrefix(strings.ToLower(mediaType), "text/html") || looksLikeHTMLDocument(text) {
 		return htmlToRichText(text)
 	}
 	return text
+}
+
+func repairMissingQuotedPrintable(data []byte) []byte {
+	if !looksLikeQuotedPrintable(data) {
+		return data
+	}
+	decoded, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(data)))
+	if err != nil || len(decoded) == 0 {
+		return data
+	}
+	return decoded
+}
+
+func looksLikeQuotedPrintable(data []byte) bool {
+	hexEscapes := 0
+	softBreaks := 0
+	for i := 0; i < len(data)-1; i++ {
+		if data[i] != '=' {
+			continue
+		}
+		if data[i+1] == '\n' {
+			softBreaks++
+			i++
+			continue
+		}
+		if i+2 < len(data) && data[i+1] == '\r' && data[i+2] == '\n' {
+			softBreaks++
+			i += 2
+			continue
+		}
+		if i+2 < len(data) && isHex(data[i+1]) && isHex(data[i+2]) {
+			hexEscapes++
+			i += 2
+		}
+	}
+	return (softBreaks > 0 && hexEscapes > 0) || softBreaks >= 2 || hexEscapes >= 3
+}
+
+func isHex(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 func looksLikeHTMLDocument(text string) bool {
