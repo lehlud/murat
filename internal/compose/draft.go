@@ -23,7 +23,14 @@ func EditWithEditor(draft protocol.Draft, editor string) (protocol.Draft, error)
 	if err := RunEditorWith(path, editor); err != nil {
 		return protocol.Draft{}, err
 	}
-	return ReadDraftFile(path)
+	parsed, err := ReadDraftFile(path)
+	if err != nil {
+		return protocol.Draft{}, err
+	}
+	if strings.TrimSpace(parsed.PGP) == "" {
+		parsed.PGP = draft.PGP
+	}
+	return parsed, nil
 }
 
 func WriteDraftFile(draft protocol.Draft) (string, error) {
@@ -32,10 +39,6 @@ func WriteDraftFile(draft protocol.Draft) (string, error) {
 		return "", err
 	}
 	defer file.Close()
-	if strings.TrimSpace(draft.PGP) != "" {
-		_, err = fmt.Fprintf(file, "From: %s\nTo: %s\nCc: %s\nBcc: %s\nSubject: %s\nPGP: %s\n\n%s", draft.From, draft.To, draft.Cc, draft.Bcc, draft.Subject, draft.PGP, draft.Body)
-		return file.Name(), err
-	}
 	_, err = fmt.Fprintf(file, "From: %s\nTo: %s\nCc: %s\nBcc: %s\nSubject: %s\n\n%s", draft.From, draft.To, draft.Cc, draft.Bcc, draft.Subject, draft.Body)
 	return file.Name(), err
 }

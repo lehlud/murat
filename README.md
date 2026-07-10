@@ -152,7 +152,9 @@ Subject: Hello
 Body text here.
 ```
 
-You can edit `From:` to send from another configured account. Replies pick the best initial sender from the message account and recipient headers.
+You can edit `From:` to send from another configured account. Replies pick the best initial sender from the message account and recipient headers. PGP options are controlled from the compose confirmation menu, not editable draft headers.
+
+Press `d` in the compose confirmation view to save a local encrypted draft. Failed sends save or update a local draft automatically. Use the `D` filter to list drafts; open one and press `space`, then `e`, to resume editing.
 
 CLI compose examples:
 

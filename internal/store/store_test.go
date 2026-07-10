@@ -87,6 +87,73 @@ func TestInlineImageAppearsAsAttachment(t *testing.T) {
 	}
 }
 
+func TestDraftDataUpdateDeleteAndAttachments(t *testing.T) {
+	s, err := Open(testPaths(t.TempDir()), bytes.Repeat([]byte{3}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := s.SaveDraftData(DraftData{
+		AccountID: "acct",
+		From:      "alice@example.com",
+		To:        "bob@example.com",
+		Bcc:       "hidden@example.com",
+		Subject:   "draft subject",
+		Body:      "oldtoken body",
+		PGP:       "sign",
+		Attachments: []Attachment{{
+			Filename:    "note.txt",
+			ContentType: "text/plain",
+			Data:        []byte("hello"),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg == nil || !msg.IsDraft() || !msg.HasAttachment {
+		t.Fatalf("draft message = %#v", msg)
+	}
+	draft, ok := s.DraftData(msg)
+	if !ok || draft.PGP != "sign" || draft.Bcc != "hidden@example.com" {
+		t.Fatalf("draft data = %#v ok=%v", draft, ok)
+	}
+	body := s.DraftBody(msg)
+	if body == nil || !strings.Contains(body.Headers, "Bcc: hidden@example.com") || body.Text != "oldtoken body" {
+		t.Fatalf("draft body = %#v", body)
+	}
+	attachments, err := s.Attachments(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attachments) != 1 || attachments[0].Filename != "note.txt" || !bytes.Equal(attachments[0].Data, []byte("hello")) {
+		t.Fatalf("attachments = %#v", attachments)
+	}
+	if got := s.Search("oldtoken", false, false, true); len(got) != 1 || got[0].Key != msg.Key {
+		t.Fatalf("search before update = %#v", got)
+	}
+	updated, err := s.UpdateDraft(msg.Key, DraftData{AccountID: "acct", From: "alice@example.com", To: "bob@example.com", Subject: "updated subject", Body: "newtoken body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Key != msg.Key || updated.Subject != "updated subject" {
+		t.Fatalf("updated = %#v", updated)
+	}
+	if got := s.Search("newtoken", false, false, true); len(got) != 1 || got[0].Key != msg.Key {
+		t.Fatalf("search after update = %#v", got)
+	}
+	if got := s.Search("oldtoken", false, false, true); len(got) != 0 {
+		t.Fatalf("old search token remained = %#v", got)
+	}
+	if err := s.DeleteDraft(msg.Key); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Drafts(); len(got) != 0 {
+		t.Fatalf("drafts after delete = %#v", got)
+	}
+	if got := s.Search("newtoken", false, false, true); len(got) != 0 {
+		t.Fatalf("search after delete = %#v", got)
+	}
+}
+
 func TestSearchIndexImportPersistRemove(t *testing.T) {
 	dir := t.TempDir()
 	paths := testPaths(dir)

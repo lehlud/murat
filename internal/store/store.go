@@ -141,6 +141,19 @@ type Attachment struct {
 	Data        []byte
 }
 
+type DraftData struct {
+	CreatedAt   string
+	AccountID   string
+	From        string
+	To          string
+	Cc          string
+	Bcc         string
+	Subject     string
+	Body        string
+	PGP         string
+	Attachments []Attachment
+}
+
 type KnownAddress struct {
 	Name   string `json:"name,omitempty"`
 	Email  string `json:"email"`
@@ -734,7 +747,14 @@ func (s *Store) OpenBody(msg *Message) (*Body, error) {
 }
 
 func (s *Store) Attachments(msg *Message) ([]Attachment, error) {
-	if msg.RawRel == "" {
+	if msg != nil && msg.IsDraft() {
+		draft, ok := s.DraftData(msg)
+		if !ok {
+			return nil, fmt.Errorf("draft not found")
+		}
+		return cloneAttachments(draft.Attachments), nil
+	}
+	if msg == nil || msg.RawRel == "" {
 		return nil, fmt.Errorf("message has no raw EML")
 	}
 	raw, err := s.readEncrypted(filepath.Join(s.paths.RawDir, msg.RawRel))
@@ -1259,64 +1279,144 @@ func firstNonEmptyString(values ...string) string {
 func (m *Message) IsDraft() bool { return strings.HasPrefix(m.Key, "draft:") }
 
 func (s *Store) SaveDraft(accountID, from, to, cc, bcc, subject, body string) error {
-	record := map[string]any{
-		"created_at": time.Now().UTC().Format(time.RFC3339),
-		"account_id": accountID,
-		"from":       from,
-		"to":         to,
-		"cc":         cc,
-		"bcc":        bcc,
-		"subject":    subject,
-		"body":       body,
+	_, err := s.SaveDraftData(DraftData{AccountID: accountID, From: from, To: to, Cc: cc, Bcc: bcc, Subject: subject, Body: body})
+	return err
+}
+
+func (s *Store) SaveDraftData(draft DraftData) (*Message, error) {
+	if strings.TrimSpace(draft.CreatedAt) == "" {
+		draft.CreatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
+	record := draftRecord(draft)
 	s.mu.Lock()
 	s.index.Drafts = append(s.index.Drafts, record)
 	key := fmt.Sprintf("draft:%d", len(s.index.Drafts)-1)
 	msg := messageFromDraft(len(s.index.Drafts)-1, record)
 	if msg != nil {
-		body := ""
-		if raw := msg.extra["body"]; len(raw) > 0 {
-			_ = json.Unmarshal(raw, &body)
-		}
-		s.updateSearchForKeyLocked(key, searchDocument(msg, body))
+		msg.store = s
+		s.updateSearchForKeyLocked(key, searchDocument(msg, draft.Body))
 	}
+	s.mu.Unlock()
+	s.MarkDirty()
+	return msg, nil
+}
+
+func (s *Store) UpdateDraft(key string, draft DraftData) (*Message, error) {
+	index, ok := draftIndex(key)
+	if !ok {
+		return nil, fmt.Errorf("draft not found")
+	}
+	s.mu.Lock()
+	if index < 0 || index >= len(s.index.Drafts) {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("draft not found")
+	}
+	current, ok := draftDataFromAny(s.index.Drafts[index])
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("draft not found")
+	}
+	if strings.TrimSpace(draft.CreatedAt) == "" {
+		draft.CreatedAt = current.CreatedAt
+	}
+	if strings.TrimSpace(draft.CreatedAt) == "" {
+		draft.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	record := draftRecord(draft)
+	s.index.Drafts[index] = record
+	msg := messageFromDraft(index, record)
+	if msg != nil {
+		msg.store = s
+		s.updateSearchForKeyLocked(key, searchDocument(msg, draft.Body))
+	}
+	s.mu.Unlock()
+	s.MarkDirty()
+	return msg, nil
+}
+
+func (s *Store) DeleteDraft(key string) error {
+	index, ok := draftIndex(key)
+	if !ok {
+		return fmt.Errorf("draft not found")
+	}
+	s.mu.Lock()
+	if index < 0 || index >= len(s.index.Drafts) {
+		s.mu.Unlock()
+		return fmt.Errorf("draft not found")
+	}
+	if _, ok := draftDataFromAny(s.index.Drafts[index]); !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("draft not found")
+	}
+	s.index.Drafts[index] = nil
+	removeSearchKey(s.search, key)
+	s.searchDirty = true
 	s.mu.Unlock()
 	s.MarkDirty()
 	return nil
 }
 
+func (s *Store) DraftData(msg *Message) (DraftData, bool) {
+	if msg == nil || !msg.IsDraft() {
+		return DraftData{}, false
+	}
+	s.mu.RLock()
+	data, ok := s.draftDataByKeyLocked(msg.Key)
+	s.mu.RUnlock()
+	return data, ok
+}
+
 func messageFromDraft(index int, value any) *Message {
-	draft, ok := value.(map[string]any)
+	draft, ok := draftDataFromAny(value)
 	if !ok {
 		return nil
 	}
-	to := splitAnyStrings(draft["to"])
-	cc := splitAnyStrings(draft["cc"])
-	created := stringAny(draft["created_at"])
+	to := singleStringSlice(draft.To)
+	cc := singleStringSlice(draft.Cc)
 	return &Message{
-		Key:        fmt.Sprintf("draft:%d", index),
-		AccountID:  stringAny(draft["account_id"]),
-		From:       firstNonEmptyString(stringAny(draft["from"]), "draft"),
-		To:         to,
-		Cc:         cc,
-		Subject:    stringAny(draft["subject"]),
-		ReceivedAt: created,
-		SentAt:     created,
-		Read:       true,
-		Tags:       []string{"draft"},
+		Key:           fmt.Sprintf("draft:%d", index),
+		AccountID:     draft.AccountID,
+		From:          firstNonEmptyString(draft.From, "draft"),
+		To:            to,
+		Cc:            cc,
+		Subject:       draft.Subject,
+		ReceivedAt:    draft.CreatedAt,
+		SentAt:        draft.CreatedAt,
+		Read:          true,
+		Tags:          []string{"draft"},
+		HasAttachment: len(draft.Attachments) > 0,
 		extra: map[string]json.RawMessage{
-			"body": rawJSON(draft["body"]),
+			"body": rawJSON(draft.Body),
 		},
 	}
 }
 
 func (s *Store) draftByKeyLocked(key string) *Message {
-	indexText := strings.TrimPrefix(key, "draft:")
-	index, err := strconv.Atoi(indexText)
-	if err != nil || index < 0 || index >= len(s.index.Drafts) {
+	index, ok := draftIndex(key)
+	if !ok || index < 0 || index >= len(s.index.Drafts) {
 		return nil
 	}
 	return messageFromDraft(index, s.index.Drafts[index])
+}
+
+func (s *Store) draftDataByKeyLocked(key string) (DraftData, bool) {
+	index, ok := draftIndex(key)
+	if !ok || index < 0 || index >= len(s.index.Drafts) {
+		return DraftData{}, false
+	}
+	return draftDataFromAny(s.index.Drafts[index])
+}
+
+func draftIndex(key string) (int, bool) {
+	indexText := strings.TrimPrefix(key, "draft:")
+	if indexText == key {
+		return 0, false
+	}
+	index, err := strconv.Atoi(indexText)
+	if err != nil {
+		return 0, false
+	}
+	return index, true
 }
 
 func (s *Store) DraftBody(msg *Message) *Body {
@@ -1324,16 +1424,137 @@ func (s *Store) DraftBody(msg *Message) *Body {
 		return nil
 	}
 	s.mu.RLock()
-	draft := s.draftByKeyLocked(msg.Key)
+	draft, ok := s.draftDataByKeyLocked(msg.Key)
 	s.mu.RUnlock()
-	if draft == nil {
+	if !ok {
 		return nil
 	}
-	body := ""
-	if raw := draft.extra["body"]; len(raw) > 0 {
-		_ = json.Unmarshal(raw, &body)
+	return &Body{Headers: draftHeaders(draft), Text: draft.Body, FetchedAt: time.Now().UTC().Format(time.RFC3339)}
+}
+
+func draftRecord(draft DraftData) map[string]any {
+	record := map[string]any{
+		"created_at": draft.CreatedAt,
+		"account_id": draft.AccountID,
+		"from":       draft.From,
+		"to":         draft.To,
+		"cc":         draft.Cc,
+		"bcc":        draft.Bcc,
+		"subject":    draft.Subject,
+		"body":       draft.Body,
+		"pgp":        draft.PGP,
 	}
-	return &Body{Text: body, FetchedAt: time.Now().UTC().Format(time.RFC3339)}
+	if len(draft.Attachments) > 0 {
+		record["attachments"] = draftAttachmentRecords(draft.Attachments)
+	}
+	return record
+}
+
+func draftDataFromAny(value any) (DraftData, bool) {
+	record, ok := value.(map[string]any)
+	if !ok {
+		return DraftData{}, false
+	}
+	return DraftData{
+		CreatedAt:   stringAny(record["created_at"]),
+		AccountID:   stringAny(record["account_id"]),
+		From:        stringAny(record["from"]),
+		To:          stringAny(record["to"]),
+		Cc:          stringAny(record["cc"]),
+		Bcc:         stringAny(record["bcc"]),
+		Subject:     stringAny(record["subject"]),
+		Body:        stringAny(record["body"]),
+		PGP:         stringAny(record["pgp"]),
+		Attachments: draftAttachmentsFromAny(record["attachments"]),
+	}, true
+}
+
+func draftHeaders(draft DraftData) string {
+	lines := []string{
+		"From: " + draft.From,
+		"To: " + draft.To,
+		"Cc: " + draft.Cc,
+		"Bcc: " + draft.Bcc,
+		"Subject: " + draft.Subject,
+	}
+	if draft.CreatedAt != "" {
+		lines = append(lines, "Date: "+draft.CreatedAt)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func draftAttachmentRecords(attachments []Attachment) []map[string]any {
+	out := make([]map[string]any, 0, len(attachments))
+	for _, attachment := range attachments {
+		data := append([]byte(nil), attachment.Data...)
+		size := attachment.Size
+		if size == 0 {
+			size = len(data)
+		}
+		out = append(out, map[string]any{
+			"filename":     attachment.Filename,
+			"content_type": attachment.ContentType,
+			"size":         size,
+			"data":         data,
+		})
+	}
+	return out
+}
+
+func draftAttachmentsFromAny(value any) []Attachment {
+	switch typed := value.(type) {
+	case []Attachment:
+		return cloneAttachments(typed)
+	case []map[string]any:
+		out := make([]Attachment, 0, len(typed))
+		for _, item := range typed {
+			if attachment, ok := draftAttachmentFromMap(item); ok {
+				out = append(out, attachment)
+			}
+		}
+		return out
+	case []any:
+		out := make([]Attachment, 0, len(typed))
+		for _, item := range typed {
+			if record, ok := item.(map[string]any); ok {
+				if attachment, ok := draftAttachmentFromMap(record); ok {
+					out = append(out, attachment)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func draftAttachmentFromMap(record map[string]any) (Attachment, bool) {
+	data := bytesAny(record["data"])
+	size := intAny(record["size"])
+	if size == 0 {
+		size = len(data)
+	}
+	attachment := Attachment{Filename: stringAny(record["filename"]), ContentType: stringAny(record["content_type"]), Size: size, Data: data}
+	return attachment, attachment.Filename != "" || attachment.ContentType != "" || len(attachment.Data) > 0
+}
+
+func cloneAttachments(attachments []Attachment) []Attachment {
+	out := make([]Attachment, 0, len(attachments))
+	for _, attachment := range attachments {
+		attachment.Data = append([]byte(nil), attachment.Data...)
+		if attachment.Size == 0 {
+			attachment.Size = len(attachment.Data)
+		}
+		out = append(out, attachment)
+	}
+	return out
+}
+
+func singleStringSlice(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return []string{value}
 }
 
 func rawJSON(value any) json.RawMessage {
@@ -1346,6 +1567,35 @@ func stringAny(value any) string {
 		return text
 	}
 	return ""
+}
+
+func intAny(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case float64:
+		return int(typed)
+	case json.Number:
+		value, _ := typed.Int64()
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+func bytesAny(value any) []byte {
+	switch typed := value.(type) {
+	case []byte:
+		return append([]byte(nil), typed...)
+	case string:
+		decoded, err := base64.StdEncoding.DecodeString(typed)
+		if err == nil {
+			return decoded
+		}
+		return []byte(typed)
+	default:
+		return nil
+	}
 }
 
 func splitAnyStrings(value any) []string {

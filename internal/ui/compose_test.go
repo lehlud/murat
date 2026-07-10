@@ -66,6 +66,38 @@ func TestMarkdownLinks(t *testing.T) {
 	}
 }
 
+func TestBareURLLinks(t *testing.T) {
+	text := "see https://www.din.de/de/din-und-seine-partner/termine/digitalisierung-im-bauwesen-umsetzen-1279612 now"
+	links := markdownLinks(text)
+	if len(links) != 1 {
+		t.Fatalf("links = %#v", links)
+	}
+	url := "https://www.din.de/de/din-und-seine-partner/termine/digitalisierung-im-bauwesen-umsetzen-1279612"
+	if links[0].start != 4 || links[0].url != url {
+		t.Fatalf("link = %#v", links[0])
+	}
+}
+
+func TestWrapUnwrapsBrokenBareURL(t *testing.T) {
+	url := "https://www.din.de/de/din-und-seine-partner/termine/digitalisierung-im-bauwesen-umsetzen-1279612"
+	broken := "https://www.din.de/de/din-und-seine-partner/termine/digitalisierung-im-bauwe\nsen-umsetzen-1279612"
+	lines := wrap(joinWrappedBareURLs(broken), 40)
+	if strings.Contains(strings.Join(lines, "\n"), "bauwe\nsen") {
+		t.Fatalf("url remained broken: %#v", lines)
+	}
+	for _, line := range lines {
+		links := markdownLinks(line)
+		if len(links) == 0 {
+			continue
+		}
+		if links[0].url != url {
+			t.Fatalf("url = %q, want %q", links[0].url, url)
+		}
+		return
+	}
+	t.Fatalf("wrapped lines contain no resolvable link: %#v", lines)
+}
+
 func TestRichPlainTextShowsLinkLabelOnly(t *testing.T) {
 	got := richPlainText("Read [the docs](https://example.com) now")
 	want := "Read the docs now"

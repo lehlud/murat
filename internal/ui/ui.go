@@ -783,6 +783,10 @@ func (a *App) handleMailAction(key string) {
 		a.statusError("no selected mail")
 		return
 	}
+	if msg.IsDraft() {
+		a.handleDraftAction(key, msg)
+		return
+	}
 	closeScope := true
 	defer func() {
 		if closeScope {
@@ -821,6 +825,35 @@ func (a *App) handleMailAction(key string) {
 	default:
 		closeScope = false
 		a.statusError("unknown mail action: " + key)
+	}
+}
+
+func (a *App) handleDraftAction(key string, msg *store.Message) {
+	closeScope := true
+	defer func() {
+		if closeScope {
+			a.actionScope = ""
+		}
+	}()
+	switch key {
+	case "e":
+		a.resumeDraft(msg)
+	case "h":
+		a.headerMode = !a.headerMode
+		a.status = ""
+	case "a":
+		a.attachmentMenu(msg)
+	case "t":
+		if err := a.store.DeleteDraft(msg.Key); err != nil {
+			a.statusError(err.Error())
+			return
+		}
+		a.preview = nil
+		a.reload()
+		a.status = "discarded draft"
+	default:
+		closeScope = false
+		a.statusError("unknown draft action: " + key)
 	}
 }
 
@@ -1342,6 +1375,24 @@ func (a *App) compose(source *store.Message, replyAll bool, forward bool) {
 			draft.Body = "\n\n" + replyAttribution(source) + "\n" + quote(sourceText) + "\n"
 		}
 	}
+	a.composeDraft(account, draft, "")
+}
+
+func (a *App) resumeDraft(msg *store.Message) {
+	draftData, ok := a.store.DraftData(msg)
+	if !ok {
+		a.statusError("draft not found")
+		return
+	}
+	account, ok := a.accountForDraftData(draftData)
+	if !ok {
+		a.statusError("no account")
+		return
+	}
+	a.composeDraft(account, protocolDraftFromStore(draftData), msg.Key)
+}
+
+func (a *App) composeDraft(account store.Account, draft protocol.Draft, draftKey string) {
 	for {
 		path, err := compose.WriteDraftFile(draft)
 		if err != nil {
@@ -1378,11 +1429,16 @@ func (a *App) compose(source *store.Message, replyAll bool, forward bool) {
 			account = sendAccount
 			continue
 		case "draft":
-			if err := a.store.SaveDraft(sendAccount.ID, parsed.From, parsed.To, parsed.Cc, parsed.Bcc, parsed.Subject, parsed.Body); err != nil {
+			if err := a.saveLocalDraft(draftKey, sendAccount.ID, parsed); err != nil {
 				a.statusError(err.Error())
 			} else {
+				a.preview = nil
 				a.reload()
-				a.status = "saved local encrypted draft"
+				if draftKey != "" {
+					a.status = "updated local encrypted draft"
+				} else {
+					a.status = "saved local encrypted draft"
+				}
 			}
 			return
 		case "send":
@@ -1390,7 +1446,7 @@ func (a *App) compose(source *store.Message, replyAll bool, forward bool) {
 				a.status = "compose cancelled: no recipient"
 				return
 			}
-			a.sendDraft(sendAccount, parsed)
+			a.sendDraft(sendAccount, parsed, draftKey)
 			return
 		default:
 			a.status = "compose cancelled"
@@ -1399,14 +1455,15 @@ func (a *App) compose(source *store.Message, replyAll bool, forward bool) {
 	}
 }
 
-func (a *App) sendDraft(account store.Account, parsed protocol.Draft) {
+func (a *App) sendDraft(account store.Account, parsed protocol.Draft, draftKey string) {
+	original := parsed
 	a.status = "preparing PGP..."
 	prepared, pgpStatus, ok := a.prepareDraftPGP(parsed)
 	if !ok {
 		return
 	}
 	a.status = "sending..."
-	go func(account store.Account, parsed protocol.Draft, pgpStatus string) {
+	go func(account store.Account, original, parsed protocol.Draft, draftKey, pgpStatus string) {
 		defer a.reportPanic()
 		accountsChanged := false
 		var err error
@@ -1422,18 +1479,84 @@ func (a *App) sendDraft(account store.Account, parsed protocol.Draft) {
 			})
 		}
 		if err != nil {
-			a.events <- event{status: err.Error(), error: true}
+			status := err.Error()
+			if saveErr := a.saveLocalDraft(draftKey, account.ID, original); saveErr != nil {
+				status += "; draft save failed: " + saveErr.Error()
+			} else if draftKey != "" {
+				status += "; kept draft"
+			} else {
+				status += "; saved draft"
+			}
+			_ = a.store.Flush()
+			a.events <- event{status: status, error: true, reload: true, accountsChanged: accountsChanged}
 			return
 		}
 		_, _ = a.store.ImportSent(account.ID, []byte(protocol.Message(account, parsed)))
+		if draftKey != "" {
+			_ = a.store.DeleteDraft(draftKey)
+		}
 		a.store.RememberAddressStrings(parsed.From, parsed.To, parsed.Cc, parsed.Bcc)
 		_ = a.store.Flush()
 		if pgpStatus != "" {
-			a.events <- event{status: "sent; " + pgpStatus, accountsChanged: accountsChanged}
+			a.events <- event{status: "sent; " + pgpStatus, accountsChanged: accountsChanged, reload: true}
 		} else {
-			a.events <- event{status: "sent", accountsChanged: accountsChanged}
+			a.events <- event{status: "sent", accountsChanged: accountsChanged, reload: true}
 		}
-	}(account, prepared, pgpStatus)
+	}(account, original, prepared, draftKey, pgpStatus)
+}
+
+func (a *App) saveLocalDraft(draftKey, accountID string, draft protocol.Draft) error {
+	data := storeDraftData(accountID, draft)
+	if draftKey != "" {
+		if _, err := a.store.UpdateDraft(draftKey, data); err == nil {
+			return nil
+		}
+	}
+	_, err := a.store.SaveDraftData(data)
+	return err
+}
+
+func storeDraftData(accountID string, draft protocol.Draft) store.DraftData {
+	return store.DraftData{
+		AccountID:   accountID,
+		From:        draft.From,
+		To:          draft.To,
+		Cc:          draft.Cc,
+		Bcc:         draft.Bcc,
+		Subject:     draft.Subject,
+		Body:        draft.Body,
+		PGP:         draft.PGP,
+		Attachments: storeDraftAttachments(draft.Attachments),
+	}
+}
+
+func protocolDraftFromStore(draft store.DraftData) protocol.Draft {
+	return protocol.Draft{
+		From:        draft.From,
+		To:          draft.To,
+		Cc:          draft.Cc,
+		Bcc:         draft.Bcc,
+		Subject:     draft.Subject,
+		Body:        draft.Body,
+		PGP:         draft.PGP,
+		Attachments: protocolDraftAttachments(draft.Attachments),
+	}
+}
+
+func storeDraftAttachments(attachments []protocol.Attachment) []store.Attachment {
+	out := make([]store.Attachment, 0, len(attachments))
+	for _, attachment := range attachments {
+		out = append(out, store.Attachment{Filename: attachment.Filename, ContentType: attachment.ContentType, Size: len(attachment.Data), Data: append([]byte(nil), attachment.Data...)})
+	}
+	return out
+}
+
+func protocolDraftAttachments(attachments []store.Attachment) []protocol.Attachment {
+	out := make([]protocol.Attachment, 0, len(attachments))
+	for _, attachment := range attachments {
+		out = append(out, protocol.Attachment{Filename: attachment.Filename, ContentType: attachment.ContentType, Data: append([]byte(nil), attachment.Data...)})
+	}
+	return out
 }
 
 func (a *App) prepareDraftPGP(parsed protocol.Draft) (protocol.Draft, string, bool) {
@@ -1720,10 +1843,6 @@ func (a *App) confirmCompose(account store.Account, draft *protocol.Draft) strin
 			a.dirty = true
 			return "send"
 		case "d":
-			if len(draft.Attachments) > 0 {
-				notice = "ERROR: attached files cannot be saved in local drafts"
-				continue
-			}
 			a.dirty = true
 			return "draft"
 		case "e":
@@ -1901,6 +2020,17 @@ func (a *App) defaultSendAccount() (store.Account, bool) {
 	return a.accountsList[0], true
 }
 
+func (a *App) accountForDraftData(draft store.DraftData) (store.Account, bool) {
+	if strings.TrimSpace(draft.AccountID) != "" {
+		for _, account := range a.accountsList {
+			if strings.EqualFold(draft.AccountID, account.ID) || strings.EqualFold(draft.AccountID, account.Email) {
+				return account, true
+			}
+		}
+	}
+	return a.defaultSendAccount()
+}
+
 func (a *App) bestComposeAccount(source *store.Message) (store.Account, bool) {
 	if len(a.accountsList) == 0 {
 		return store.Account{}, false
@@ -2039,7 +2169,7 @@ func (a *App) draw() {
 	a.listArea = area{y: 1, x: 0, h: top, w: w}
 	a.bodyArea = area{y: 2 + top, x: 0, h: h - 3 - top - 1, w: w}
 	a.drawList(a.listArea.y, a.listArea.x, a.listArea.h, a.listArea.w)
-	printStyledLine(1+top, 0, w, strings.Repeat("-", w), styleDivider)
+	printStyledLine(1+top, 0, w, strings.Repeat("—", w), styleDivider)
 	a.drawPreview(a.bodyArea.y, a.bodyArea.x, a.bodyArea.h, a.bodyArea.w)
 }
 
@@ -2150,6 +2280,7 @@ type previewLine struct {
 }
 
 func previewLines(msg *store.Message, content string, width int) []previewLine {
+	content = joinWrappedBareURLs(content)
 	rows := []previewLine{
 		{label: "Subject", value: msg.Subject},
 		{label: "From", value: msg.From},
@@ -2217,6 +2348,9 @@ func previewLinks(line previewLine) []markdownLink {
 
 func (a *App) shortcuts() string {
 	if a.actionScope == "mail" {
+		if msg := a.currentAction(); msg != nil && msg.IsDraft() {
+			return "draft: e resume  h headers  a attach  t discard  esc back"
+		}
 		return "mail: r reply  R reply-all  f forward  h headers  a attach  u unread  t trash  s spam  esc back"
 	}
 	if a.actionScope == "filter" {
@@ -2411,8 +2545,8 @@ func printRichLine(y, x, width int, text string) {
 	col := 0
 	bold, italic, under := false, false, false
 	for i := 0; i < len(text) && col < width; {
-		if raw, _, label, ok := markdownLinkAt(text, i); ok {
-			chunk := richPlainText(label)
+		if raw, url, label, ok := richLinkAt(text, i); ok {
+			chunk := linkDisplayText(raw, url, label)
 			if displayLen(chunk) > width-col {
 				chunk = clipRunes(chunk, width-col)
 			}
@@ -2438,7 +2572,7 @@ func printRichLine(y, x, width int, text string) {
 		}
 		start := i
 		for i < len(text) && !strings.HasPrefix(text[i:], "**") && !strings.HasPrefix(text[i:], "__") && text[i] != '*' {
-			if _, _, _, ok := markdownLinkAt(text, i); ok {
+			if _, _, _, ok := richLinkAt(text, i); ok {
 				break
 			}
 			i++
@@ -2462,16 +2596,23 @@ type markdownLink struct {
 func markdownLinks(text string) []markdownLink {
 	out := []markdownLink{}
 	for i := 0; i < len(text); {
-		raw, url, label, ok := markdownLinkAt(text, i)
+		raw, url, label, ok := richLinkAt(text, i)
 		if !ok {
 			i++
 			continue
 		}
 		start := displayLen(richPlainText(text[:i]))
-		out = append(out, markdownLink{start: start, end: start + displayLen(richPlainText(label)), url: url})
+		out = append(out, markdownLink{start: start, end: start + displayLen(linkDisplayText(raw, url, label)), url: url})
 		i += len(raw)
 	}
 	return out
+}
+
+func richLinkAt(text string, i int) (string, string, string, bool) {
+	if raw, url, label, ok := markdownLinkAt(text, i); ok {
+		return raw, url, label, true
+	}
+	return bareURLAt(text, i)
 }
 
 func markdownLinkAt(text string, i int) (string, string, string, bool) {
@@ -2496,11 +2637,66 @@ func markdownLinkAt(text string, i int) (string, string, string, bool) {
 	return text[i : urlEnd+1], url, text[i+1 : labelEnd], true
 }
 
+func linkDisplayText(raw, url, label string) string {
+	if raw == url && label == url {
+		return label
+	}
+	return richPlainText(label)
+}
+
+func bareURLAt(text string, i int) (string, string, string, bool) {
+	prefix := bareURLPrefix(text, i)
+	if prefix == "" {
+		return "", "", "", false
+	}
+	if i > 0 && !bareURLBoundaryBefore(text[i-1]) {
+		return "", "", "", false
+	}
+	end := i + len(prefix)
+	for end < len(text) {
+		r, size := utf8.DecodeRuneInString(text[end:])
+		if size <= 0 || bareURLTerminator(r) {
+			break
+		}
+		end += size
+	}
+	raw := strings.TrimRightFunc(text[i:end], trailingURLPunctuation)
+	if len(raw) <= len(prefix) {
+		return "", "", "", false
+	}
+	return raw, raw, raw, true
+}
+
+func bareURLPrefix(text string, i int) string {
+	if i < 0 || i >= len(text) {
+		return ""
+	}
+	lower := strings.ToLower(text[i:])
+	for _, prefix := range []string{"https://", "http://", "mailto:"} {
+		if strings.HasPrefix(lower, prefix) {
+			return text[i : i+len(prefix)]
+		}
+	}
+	return ""
+}
+
+func bareURLBoundaryBefore(b byte) bool {
+	return b <= ' ' || strings.ContainsRune("([<{", rune(b))
+}
+
+func bareURLTerminator(r rune) bool {
+	return r <= ' ' || strings.ContainsRune("<>\"'", r)
+}
+
+func trailingURLPunctuation(r rune) bool {
+	return strings.ContainsRune(".,;:!?)]}", r)
+}
+
 func richPlainText(text string) string {
 	var out strings.Builder
 	for i := 0; i < len(text); {
-		if raw, _, label, ok := markdownLinkAt(text, i); ok {
-			out.WriteString(richPlainText(label))
+		if raw, url, label, ok := richLinkAt(text, i); ok {
+			out.WriteString(linkDisplayText(raw, url, label))
 			i += len(raw)
 			continue
 		}
@@ -3104,6 +3300,39 @@ func addressKey(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+func joinWrappedBareURLs(text string) string {
+	if !strings.Contains(text, "\n") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if len(out) > 0 && continuesBareURL(out[len(out)-1], line) {
+			out[len(out)-1] = strings.TrimRight(out[len(out)-1], " \t\r") + strings.TrimRight(line, "\r")
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func continuesBareURL(previous, next string) bool {
+	previous = strings.TrimRight(previous, " \t\r")
+	if displayLen(previous) < 60 || next == "" || next[0] == ' ' || next[0] == '\t' {
+		return false
+	}
+	start := strings.LastIndexAny(previous, " \t") + 1
+	if start < 0 || start >= len(previous) || bareURLPrefix(previous, start) == "" {
+		return false
+	}
+	token := previous[start:]
+	if strings.ContainsAny(token, " \t") {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(next)
+	return r > ' ' && !bareURLTerminator(r) && !strings.ContainsRune("([{<", r)
+}
+
 func wrap(text string, width int) []string {
 	if width < 10 {
 		width = 10
@@ -3146,8 +3375,8 @@ func wrapRichLine(text string, width int) []string {
 }
 
 func richWrapToken(text string, i int) (int, int) {
-	if raw, _, label, ok := markdownLinkAt(text, i); ok {
-		return i + len(raw), displayLen(richPlainText(label))
+	if raw, url, label, ok := richLinkAt(text, i); ok {
+		return i + len(raw), displayLen(linkDisplayText(raw, url, label))
 	}
 	if strings.HasPrefix(text[i:], "**") || strings.HasPrefix(text[i:], "__") {
 		return i + 2, 0
