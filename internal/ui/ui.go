@@ -109,6 +109,10 @@ type App struct {
 	selectStart  *point
 	selectEnd    *point
 	selectActive bool
+	selectDrag   bool
+	selectLastX  int
+	selectLastY  int
+	selectLastOK bool
 	selectToken  int
 	dirty        bool
 	lastW        int
@@ -525,6 +529,9 @@ func (a *App) run() error {
 			return err
 		}
 		if key == "" {
+			if a.autoScrollSelection() {
+				a.dirty = true
+			}
 			continue
 		}
 		if a.handle(key) {
@@ -961,27 +968,31 @@ func (a *App) handleMouse(key string) bool {
 		}
 		return true
 	}
+	if a.preview != nil && a.selectActive {
+		if release == "release" {
+			a.updateSelection(x, y)
+			if samePoint(a.selectStart, a.selectEnd) && pointInArea(x, y, a.bodyArea) {
+				if url := a.linkAtBodyPoint(x, y); url != "" {
+					a.confirmLink(url)
+					return true
+				}
+			}
+			a.finishSelection()
+			return true
+		}
+		if button&32 != 0 {
+			a.selectDrag = true
+			a.updateSelection(x, y)
+			a.autoScrollSelection()
+			return true
+		}
+	}
 	if a.preview != nil && pointInArea(x, y, a.bodyArea) {
 		if release == "release" {
-			if a.selectActive {
-				a.updateSelection(x, y)
-				if samePoint(a.selectStart, a.selectEnd) {
-					if url := a.linkAtBodyPoint(x, y); url != "" {
-						a.confirmLink(url)
-						return true
-					}
-				}
-				a.finishSelection()
-				return true
-			}
 			return false
 		}
 		if button == 0 {
 			a.startSelection(x, y)
-			return true
-		}
-		if button&32 != 0 && a.selectActive {
-			a.updateSelection(x, y)
 			return true
 		}
 	}
@@ -1005,12 +1016,43 @@ func (a *App) startSelection(x, y int) {
 	a.selectStart = &p
 	a.selectEnd = &p
 	a.selectActive = true
+	a.selectDrag = false
+	a.rememberSelectionMouse(x, y)
 	a.selectToken++
 }
 
 func (a *App) updateSelection(x, y int) {
 	p := a.bodyPoint(x, y)
 	a.selectEnd = &p
+	a.rememberSelectionMouse(x, y)
+}
+
+func (a *App) rememberSelectionMouse(x, y int) {
+	a.selectLastX = x
+	a.selectLastY = y
+	a.selectLastOK = true
+}
+
+func (a *App) autoScrollSelection() bool {
+	if !a.selectActive || !a.selectDrag || !a.selectLastOK || a.preview == nil || a.bodyArea.h <= 0 {
+		return false
+	}
+	delta := 0
+	if a.selectLastY <= a.bodyArea.y {
+		delta = -1
+	} else if a.selectLastY >= a.bodyArea.y+a.bodyArea.h-1 {
+		delta = 1
+	}
+	if delta == 0 {
+		return false
+	}
+	before := a.bodyScroll
+	a.scrollBody(delta)
+	if a.bodyScroll == before {
+		return false
+	}
+	a.updateSelection(a.selectLastX, a.selectLastY)
+	return true
 }
 
 func (a *App) finishSelection() {
@@ -1032,6 +1074,8 @@ func (a *App) clearSelection() {
 	a.selectStart = nil
 	a.selectEnd = nil
 	a.selectActive = false
+	a.selectDrag = false
+	a.selectLastOK = false
 	a.selectToken++
 }
 
@@ -2276,11 +2320,18 @@ type previewLine struct {
 	label string
 	value string
 	text  string
+	rich  richState
 	blank bool
 }
 
+type richState struct {
+	bold   bool
+	italic bool
+	under  bool
+}
+
 func previewLines(msg *store.Message, content string, width int) []previewLine {
-	content = joinWrappedBareURLs(content)
+	content = normalizePreviewText(content)
 	rows := []previewLine{
 		{label: "Subject", value: msg.Subject},
 		{label: "From", value: msg.From},
@@ -2292,9 +2343,7 @@ func previewLines(msg *store.Message, content string, width int) []previewLine {
 	if strings.TrimSpace(content) == "" {
 		content = "(no body)"
 	}
-	for _, line := range wrap(content, max(10, width-1)) {
-		rows = append(rows, previewLine{text: line})
-	}
+	rows = append(rows, wrapPreviewContent(content, max(10, width-1))...)
 	return rows
 }
 
@@ -2304,29 +2353,37 @@ func printPreviewLine(y, x, width int, line previewLine) {
 		return
 	}
 	if line.label != "" {
-		labelWidth := 9
-		printLine(y, x, width, "")
-		printSegment(y, x, min(labelWidth, width), line.label+":", styleLabel)
-		if width > labelWidth {
-			style := ""
-			if line.label == "Tags" {
-				style = styleStatus
-			}
-			printSegment(y, x+labelWidth, width-labelWidth, line.value, style)
+		style := ""
+		if line.label == "Tags" {
+			style = styleStatus
 		}
+		printStyledRuns(y, x, width, []styledRun{
+			{text: padRight(line.label+":", 9), style: styleLabel},
+			{text: line.value, style: style},
+		}, [2]int{})
 		return
 	}
-	printRichLine(y, x, width, line.text)
+	printRichLine(y, x, width, line.text, line.rich)
 }
 
 func printSelectedPreviewLine(y, x, width int, line previewLine, selected [2]int) {
-	text := previewPlainText(line)
-	printLine(y, x, width, "")
-	left := selected[0]
-	right := selected[1]
-	printSegment(y, x, width, sliceRunes(text, 0, left), "")
-	printSegment(y, x+left, max(0, width-left), sliceRunes(text, left, right), styleSelected)
-	printSegment(y, x+right, max(0, width-right), sliceRunes(text, right, displayLen(text)), "")
+	if line.blank {
+		printLine(y, x, width, "")
+		return
+	}
+	if line.label != "" {
+		label := padRight(line.label+":", 9)
+		style := ""
+		if line.label == "Tags" {
+			style = styleStatus
+		}
+		printStyledRuns(y, x, width, []styledRun{
+			{text: label, style: styleLabel},
+			{text: line.value, style: style},
+		}, selected)
+		return
+	}
+	printStyledRuns(y, x, width, richRuns(line.text, line.rich), selected)
 }
 
 func previewPlainText(line previewLine) string {
@@ -2540,18 +2597,24 @@ func printSegment(y, x, width int, text, style string) {
 	fmt.Printf("\x1b[%d;%dH%s%s%s", y+1, x+1, style, text, styleReset)
 }
 
-func printRichLine(y, x, width int, text string) {
-	printLine(y, x, width, "")
-	col := 0
-	bold, italic, under := false, false, false
-	for i := 0; i < len(text) && col < width; {
+func printRichLine(y, x, width int, text string, initial richState) {
+	printStyledRuns(y, x, width, richRuns(text, initial), [2]int{})
+}
+
+type styledRun struct {
+	text  string
+	style string
+}
+
+func richRuns(text string, initial richState) []styledRun {
+	runs := []styledRun{}
+	bold, italic, under := initial.bold, initial.italic, initial.under
+	for i := 0; i < len(text); {
 		if raw, url, label, ok := richLinkAt(text, i); ok {
 			chunk := linkDisplayText(raw, url, label)
-			if displayLen(chunk) > width-col {
-				chunk = clipRunes(chunk, width-col)
+			if chunk != "" {
+				runs = append(runs, styledRun{text: chunk, style: styleLink})
 			}
-			printSegment(y, x+col, width-col, chunk, styleLink)
-			col += displayLen(chunk)
 			i += len(raw)
 			continue
 		}
@@ -2578,13 +2641,64 @@ func printRichLine(y, x, width int, text string) {
 			i++
 		}
 		chunk := text[start:i]
-		if len(chunk) > width-col {
-			chunk = chunk[:width-col]
+		if chunk != "" {
+			runs = append(runs, styledRun{text: chunk, style: richStyle(bold, italic, under)})
 		}
-		style := richStyle(bold, italic, under)
-		printSegment(y, x+col, width-col, chunk, style)
-		col += len(chunk)
 	}
+	return runs
+}
+
+func printStyledRuns(y, x, width int, runs []styledRun, selected [2]int) {
+	col := 0
+	for _, run := range runs {
+		if col >= width {
+			return
+		}
+		text := run.text
+		length := displayLen(text)
+		if length <= 0 {
+			continue
+		}
+		if length > width-col {
+			text = clipRunes(text, width-col)
+			length = displayLen(text)
+		}
+		printStyledRun(y, x, width, col, text, run.style, selected)
+		col += length
+	}
+	if col < width {
+		printSegment(y, x+col, width-col, strings.Repeat(" ", width-col), "")
+	}
+}
+
+func printStyledRun(y, x, width, col int, text, style string, selected [2]int) {
+	length := displayLen(text)
+	if length <= 0 {
+		return
+	}
+	left, right := selected[0], selected[1]
+	if right <= left || col+length <= left || col >= right {
+		printSegment(y, x+col, width-col, text, style)
+		return
+	}
+
+	if col < left {
+		plainLen := left - col
+		printSegment(y, x+col, width-col, sliceRunes(text, 0, plainLen), style)
+	}
+	selectLeft := max(0, left-col)
+	selectRight := min(length, right-col)
+	if selectRight > selectLeft {
+		printSegment(y, x+col+selectLeft, width-col-selectLeft, sliceRunes(text, selectLeft, selectRight), selectedStyle(style))
+	}
+	if right < col+length {
+		plainLeft := right - col
+		printSegment(y, x+right, width-right, sliceRunes(text, plainLeft, length), style)
+	}
+}
+
+func selectedStyle(style string) string {
+	return styleSelected + style
 }
 
 type markdownLink struct {
@@ -2601,8 +2715,13 @@ func markdownLinks(text string) []markdownLink {
 			i++
 			continue
 		}
+		display := linkDisplayText(raw, url, label)
+		if display == "" {
+			i += len(raw)
+			continue
+		}
 		start := displayLen(richPlainText(text[:i]))
-		out = append(out, markdownLink{start: start, end: start + displayLen(linkDisplayText(raw, url, label)), url: url})
+		out = append(out, markdownLink{start: start, end: start + displayLen(display), url: url})
 		i += len(raw)
 	}
 	return out
@@ -2612,29 +2731,215 @@ func richLinkAt(text string, i int) (string, string, string, bool) {
 	if raw, url, label, ok := markdownLinkAt(text, i); ok {
 		return raw, url, label, true
 	}
+	if raw, url, label, ok := outlookLinkAt(text, i); ok {
+		return raw, url, label, true
+	}
 	return bareURLAt(text, i)
 }
 
-func markdownLinkAt(text string, i int) (string, string, string, bool) {
-	if i >= len(text) || text[i] != '[' {
+func outlookLinkAt(text string, i int) (string, string, string, bool) {
+	angleStart := strings.IndexByte(text[i:], '<')
+	if angleStart <= 0 {
 		return "", "", "", false
 	}
-	labelEnd := strings.Index(text[i:], "](")
-	if labelEnd <= 1 {
+	angleStart += i
+	labelEnd := trimRightLabelSpace(text, angleStart)
+	if labelEnd <= i {
 		return "", "", "", false
 	}
-	labelEnd += i
-	urlStart := labelEnd + 2
-	urlEnd := strings.IndexByte(text[urlStart:], ')')
+	labelStart := outlookLinkLabelStart(text, labelEnd, labelEnd == angleStart)
+	if labelStart != i {
+		return "", "", "", false
+	}
+	urlStart := angleStart + 1
+	urlEnd := strings.IndexByte(text[urlStart:], '>')
 	if urlEnd <= 0 {
 		return "", "", "", false
 	}
 	urlEnd += urlStart
 	url := strings.TrimSpace(text[urlStart:urlEnd])
-	if url == "" || (!strings.HasPrefix(strings.ToLower(url), "http://") && !strings.HasPrefix(strings.ToLower(url), "https://") && !strings.HasPrefix(strings.ToLower(url), "mailto:")) {
+	label := strings.TrimSpace(text[labelStart:labelEnd])
+	if label == "" || !isLinkURL(url) || invalidOutlookLinkLabel(label, url) {
 		return "", "", "", false
 	}
-	return text[i : urlEnd+1], url, text[i+1 : labelEnd], true
+	return text[labelStart : urlEnd+1], url, label, true
+}
+
+func invalidOutlookLinkLabel(label, url string) bool {
+	if strings.ContainsAny(label, "<>") {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(url), "mailto:") && strings.Contains(label, "@") {
+		return !strings.EqualFold(strings.TrimPrefix(url, url[:len("mailto:")]), label)
+	}
+	return false
+}
+
+func trimRightLabelSpace(text string, end int) int {
+	for end > 0 {
+		r, size := utf8.DecodeLastRuneInString(text[:end])
+		if size <= 0 || (r != ' ' && r != '\t') {
+			break
+		}
+		end -= size
+	}
+	return end
+}
+
+func outlookLinkLabelStart(text string, angleStart int, allowCompact bool) int {
+	if allowCompact {
+		if start, ok := compactOutlookLinkLabelStart(text, angleStart); ok {
+			return start
+		}
+	}
+	segmentStart := 0
+	for pos := angleStart; pos > 0; {
+		r, size := utf8.DecodeLastRuneInString(text[:pos])
+		if size <= 0 {
+			pos--
+			continue
+		}
+		pos -= size
+		if r == '\n' || r == '\r' || r == '\t' || r == '|' {
+			segmentStart = pos + size
+			break
+		}
+	}
+	if start := lastWideSpaceRunEnd(text[segmentStart:angleStart]); start >= 0 {
+		segmentStart += start
+	}
+	for segmentStart < angleStart {
+		r, size := utf8.DecodeRuneInString(text[segmentStart:angleStart])
+		if size <= 0 || (r != ' ' && r != '\t') {
+			break
+		}
+		segmentStart += size
+	}
+	return segmentStart
+}
+
+func compactOutlookLinkLabelStart(text string, labelEnd int) (int, bool) {
+	start := labelEnd
+	for start > 0 {
+		r, size := utf8.DecodeLastRuneInString(text[:start])
+		if size <= 0 {
+			break
+		}
+		if r <= ' ' || strings.ContainsRune(",;|()[]{}<>\"'", r) {
+			break
+		}
+		start -= size
+	}
+	if start == labelEnd || compactLabelInsideAngle(text, start) {
+		return 0, false
+	}
+	label := text[start:labelEnd]
+	if strings.Contains(label, "@") || strings.Contains(label, ".") {
+		return start, true
+	}
+	return 0, false
+}
+
+func compactLabelInsideAngle(text string, start int) bool {
+	if start <= 0 {
+		return false
+	}
+	r, _ := utf8.DecodeLastRuneInString(text[:start])
+	return r == '<'
+}
+
+func lastWideSpaceRunEnd(text string) int {
+	out := -1
+	runStart := -1
+	runWidth := 0
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if size <= 0 {
+			size = 1
+		}
+		if r == ' ' || r == '\t' {
+			if runWidth == 0 {
+				runStart = i
+			}
+			runWidth++
+		} else {
+			if runWidth >= 2 {
+				out = i
+			}
+			runStart = -1
+			runWidth = 0
+		}
+		i += size
+	}
+	if runStart >= 0 && runWidth >= 2 {
+		out = len(text)
+	}
+	return out
+}
+
+func markdownLinkAt(text string, i int) (string, string, string, bool) {
+	end, url, label, ok := parseMarkdownLinkAt(text, i)
+	if !ok {
+		return "", "", "", false
+	}
+	return text[i:end], url, label, true
+}
+
+func parseMarkdownLinkAt(text string, i int) (int, string, string, bool) {
+	if i >= len(text) || text[i] != '[' {
+		return 0, "", "", false
+	}
+	labelEnd := strings.IndexByte(text[i+1:], ']')
+	if labelEnd < 0 {
+		return 0, "", "", false
+	}
+	labelEnd += i + 1
+	openParen := skipMarkdownLinkSpace(text, labelEnd+1)
+	if openParen >= len(text) || text[openParen] != '(' {
+		return 0, "", "", false
+	}
+	urlStart := skipMarkdownLinkSpace(text, openParen+1)
+	var url strings.Builder
+	urlEnd := urlStart
+	for urlEnd < len(text) {
+		r, size := utf8.DecodeRuneInString(text[urlEnd:])
+		if size <= 0 {
+			break
+		}
+		if r == ')' {
+			break
+		}
+		if r <= ' ' {
+			urlEnd += size
+			continue
+		}
+		url.WriteString(text[urlEnd : urlEnd+size])
+		urlEnd += size
+	}
+	if urlEnd >= len(text) || text[urlEnd] != ')' || !isLinkURL(url.String()) {
+		return 0, "", "", false
+	}
+	return urlEnd + 1, url.String(), normalizeLinkLabel(text[i+1 : labelEnd]), true
+}
+
+func skipMarkdownLinkSpace(text string, index int) int {
+	for index < len(text) {
+		r, size := utf8.DecodeRuneInString(text[index:])
+		if size <= 0 || r > ' ' {
+			break
+		}
+		index += size
+	}
+	return index
+}
+
+func normalizeLinkLabel(label string) string {
+	return strings.Join(strings.Fields(label), " ")
+}
+
+func isLinkURL(url string) bool {
+	lower := strings.ToLower(url)
+	return url != "" && (strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "mailto:") || strings.HasPrefix(lower, "tel:"))
 }
 
 func linkDisplayText(raw, url, label string) string {
@@ -2672,7 +2977,7 @@ func bareURLPrefix(text string, i int) string {
 		return ""
 	}
 	lower := strings.ToLower(text[i:])
-	for _, prefix := range []string{"https://", "http://", "mailto:"} {
+	for _, prefix := range []string{"https://", "http://", "mailto:", "tel:"} {
 		if strings.HasPrefix(lower, prefix) {
 			return text[i : i+len(prefix)]
 		}
@@ -3300,6 +3605,113 @@ func addressKey(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+func normalizePreviewText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = stripInlineControlChars(text)
+	text = strings.ReplaceAll(text, "\u00a0", " ")
+	text = normalizeOutlookAngleURLs(text)
+	text = normalizeMarkdownEmailLinks(text)
+	text = joinWrappedBareURLs(text)
+	text = joinForwardedHeaderContinuations(text)
+	return compactForwardedHeaderBlanks(text)
+}
+
+func stripInlineControlChars(text string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\n':
+			return r
+		case '\t':
+			return ' '
+		}
+		if r < ' ' || (r >= 0x7f && r < 0xa0) {
+			return -1
+		}
+		return r
+	}, text)
+}
+
+func normalizeMarkdownEmailLinks(text string) string {
+	if !strings.Contains(text, "[") {
+		return text
+	}
+	var out strings.Builder
+	for i := 0; i < len(text); {
+		end, url, label, ok := parseMarkdownLinkAt(text, i)
+		if !ok {
+			out.WriteByte(text[i])
+			i++
+			continue
+		}
+		out.WriteByte('[')
+		out.WriteString(label)
+		out.WriteString("](")
+		out.WriteString(url)
+		out.WriteByte(')')
+		i = end
+	}
+	return out.String()
+}
+
+func normalizeOutlookAngleURLs(text string) string {
+	if !strings.Contains(text, "<") {
+		return text
+	}
+	var out strings.Builder
+	for i := 0; i < len(text); {
+		if text[i] != '<' {
+			out.WriteByte(text[i])
+			i++
+			continue
+		}
+		urlStart := skipAngleURLSpace(text, i+1)
+		if urlStart >= len(text) || bareURLPrefix(text, urlStart) == "" {
+			out.WriteByte(text[i])
+			i++
+			continue
+		}
+		var url strings.Builder
+		j := urlStart
+		for j < len(text) {
+			r, size := utf8.DecodeRuneInString(text[j:])
+			if size <= 0 {
+				break
+			}
+			if r == '>' {
+				break
+			}
+			if r <= ' ' {
+				j += size
+				continue
+			}
+			url.WriteString(text[j : j+size])
+			j += size
+		}
+		if j >= len(text) || text[j] != '>' || !isLinkURL(url.String()) {
+			out.WriteByte(text[i])
+			i++
+			continue
+		}
+		out.WriteByte('<')
+		out.WriteString(url.String())
+		out.WriteByte('>')
+		i = j + 1
+	}
+	return out.String()
+}
+
+func skipAngleURLSpace(text string, index int) int {
+	for index < len(text) {
+		r, size := utf8.DecodeRuneInString(text[index:])
+		if size <= 0 || r > ' ' {
+			break
+		}
+		index += size
+	}
+	return index
+}
+
 func joinWrappedBareURLs(text string) string {
 	if !strings.Contains(text, "\n") {
 		return text
@@ -3321,16 +3733,206 @@ func continuesBareURL(previous, next string) bool {
 	if displayLen(previous) < 60 || next == "" || next[0] == ' ' || next[0] == '\t' {
 		return false
 	}
-	start := strings.LastIndexAny(previous, " \t") + 1
-	if start < 0 || start >= len(previous) || bareURLPrefix(previous, start) == "" {
+	start := lastBareURLStart(previous)
+	if start < 0 {
 		return false
 	}
 	token := previous[start:]
-	if strings.ContainsAny(token, " \t") {
+	if strings.ContainsAny(token, " \t\r\n>") {
 		return false
 	}
 	r, _ := utf8.DecodeRuneInString(next)
 	return r > ' ' && !bareURLTerminator(r) && !strings.ContainsRune("([{<", r)
+}
+
+func lastBareURLStart(text string) int {
+	start := -1
+	for i := 0; i < len(text); {
+		if bareURLPrefix(text, i) != "" && (i == 0 || bareURLBoundaryBefore(text[i-1])) {
+			start = i
+		}
+		_, size := utf8.DecodeRuneInString(text[i:])
+		if size <= 0 {
+			i++
+		} else {
+			i += size
+		}
+	}
+	return start
+}
+
+func joinForwardedHeaderContinuations(text string) string {
+	if !strings.Contains(text, "\n") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && len(out) > 0 {
+			lastIndex := len(out) - 1
+			last := strings.TrimSpace(out[lastIndex])
+			if mailForwardHeaderLine(last) && !mailForwardHeaderLine(trimmed) && !startsStructuredLine(trimmed) {
+				out[lastIndex] = strings.TrimRight(out[lastIndex], " \t") + " " + trimmed
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func compactForwardedHeaderBlanks(text string) string {
+	if !strings.Contains(text, "\n") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	blank := false
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			out = append(out, line)
+			blank = false
+			continue
+		}
+		prev := previousNonBlank(out)
+		next := nextNonBlank(lines, i+1)
+		if mailForwardHeaderLine(prev) && mailForwardHeaderLine(next) {
+			continue
+		}
+		if blank {
+			continue
+		}
+		out = append(out, "")
+		blank = true
+	}
+	return strings.Join(out, "\n")
+}
+
+func previousNonBlank(lines []string) string {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if text := strings.TrimSpace(lines[i]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func nextNonBlank(lines []string, start int) string {
+	for i := start; i < len(lines); i++ {
+		if text := strings.TrimSpace(lines[i]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func mailForwardHeaderLine(line string) bool {
+	line = strings.TrimSpace(strings.TrimLeft(line, ">"))
+	label, _, ok := strings.Cut(line, ":")
+	if !ok {
+		return false
+	}
+	label = strings.ToLower(strings.TrimSpace(label))
+	label = strings.Trim(label, "*_")
+	switch label {
+	case "von", "from", "gesendet", "sent", "an", "to", "cc", "bcc", "betreff", "subject", "datum", "date", "antwort an", "reply-to", "reply to":
+		return true
+	default:
+		return false
+	}
+}
+
+func startsStructuredLine(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+	if strings.HasPrefix(line, ">") || strings.HasPrefix(line, "-") || strings.HasPrefix(line, "*") || strings.HasPrefix(line, "•") {
+		return true
+	}
+	if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "mailto:") || strings.HasPrefix(line, "tel:") {
+		return true
+	}
+	return mailForwardHeaderLine(line)
+}
+
+func wrapPreviewContent(text string, width int) []previewLine {
+	if width < 10 {
+		width = 10
+	}
+	out := []previewLine{}
+	state := richState{}
+	for _, raw := range strings.Split(text, "\n") {
+		if raw == "" {
+			out = append(out, previewLine{text: ""})
+			state = richState{}
+			continue
+		}
+		var lines []previewLine
+		lines, state = wrapRichPreviewLine(raw, width, state)
+		out = append(out, lines...)
+	}
+	return out
+}
+
+func wrapRichPreviewLine(text string, width int, initial richState) ([]previewLine, richState) {
+	out := []previewLine{}
+	start := 0
+	col := 0
+	state := initial
+	lineState := state
+	for i := 0; i < len(text); {
+		next, tokenWidth, nextState := richWrapTokenState(text, i, state)
+		if col > 0 && col+tokenWidth > width {
+			out = append(out, previewLine{text: text[start:i], rich: lineState})
+			start = i
+			col = 0
+			lineState = state
+			continue
+		}
+		if col == 0 && tokenWidth > width {
+			out = append(out, previewLine{text: text[start:next], rich: lineState})
+			start = next
+			i = next
+			state = nextState
+			lineState = state
+			continue
+		}
+		col += tokenWidth
+		i = next
+		state = nextState
+	}
+	if start < len(text) {
+		out = append(out, previewLine{text: text[start:], rich: lineState})
+	}
+	if len(out) == 0 {
+		out = append(out, previewLine{text: "", rich: lineState})
+	}
+	return out, state
+}
+
+func richWrapTokenState(text string, i int, state richState) (int, int, richState) {
+	if raw, url, label, ok := richLinkAt(text, i); ok {
+		return i + len(raw), displayLen(linkDisplayText(raw, url, label)), state
+	}
+	if strings.HasPrefix(text[i:], "**") {
+		state.bold = !state.bold
+		return i + 2, 0, state
+	}
+	if strings.HasPrefix(text[i:], "__") {
+		state.under = !state.under
+		return i + 2, 0, state
+	}
+	if text[i] == '*' {
+		state.italic = !state.italic
+		return i + 1, 0, state
+	}
+	_, size := utf8.DecodeRuneInString(text[i:])
+	if size <= 0 {
+		return i + 1, 1, state
+	}
+	return i + size, 1, state
 }
 
 func wrap(text string, width int) []string {
@@ -3412,14 +4014,7 @@ func shorten(value string, width int) string {
 }
 
 func clipRunes(value string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	runes := []rune(value)
-	if len(runes) <= width {
-		return value
-	}
-	return string(runes[:width])
+	return sliceRunes(value, 0, width)
 }
 
 func padRight(value string, width int) string {
@@ -3430,20 +4025,63 @@ func padRight(value string, width int) string {
 	return value + strings.Repeat(" ", width-length)
 }
 
-func displayLen(value string) int { return len([]rune(value)) }
+func displayLen(value string) int {
+	width := 0
+	for _, r := range value {
+		width += runeDisplayWidth(r)
+	}
+	return width
+}
 
 func sliceRunes(value string, start, end int) string {
-	runes := []rune(value)
 	if start < 0 {
 		start = 0
 	}
-	if end > len(runes) {
-		end = len(runes)
+	if end < start {
+		end = start
 	}
-	if start > end {
-		start = end
+	var out strings.Builder
+	col := 0
+	for _, r := range value {
+		width := runeDisplayWidth(r)
+		next := col + width
+		if next <= start {
+			col = next
+			continue
+		}
+		if col >= end || next > end {
+			break
+		}
+		out.WriteRune(r)
+		col = next
 	}
-	return string(runes[start:end])
+	return out.String()
+}
+
+func runeDisplayWidth(r rune) int {
+	if r == 0 {
+		return 0
+	}
+	if r < 0x20 || (r >= 0x7f && r < 0xa0) {
+		return 0
+	}
+	if isWideRune(r) {
+		return 2
+	}
+	return 1
+}
+
+func isWideRune(r rune) bool {
+	return (r >= 0x1100 && r <= 0x115f) ||
+		r == 0x2329 || r == 0x232a ||
+		(r >= 0x2e80 && r <= 0xa4cf && r != 0x303f) ||
+		(r >= 0xac00 && r <= 0xd7a3) ||
+		(r >= 0xf900 && r <= 0xfaff) ||
+		(r >= 0xfe10 && r <= 0xfe19) ||
+		(r >= 0xfe30 && r <= 0xfe6f) ||
+		(r >= 0xff00 && r <= 0xff60) ||
+		(r >= 0xffe0 && r <= 0xffe6) ||
+		(r >= 0x1f300 && r <= 0x1faff)
 }
 
 func max(a, b int) int {
