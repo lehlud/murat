@@ -12,6 +12,7 @@ It syncs mail over IMAPS or JMAP, stores messages locally under your XDG data di
 - IMAPS and JMAP sync with delta fetching for already-known remote messages.
 - SMTPS and JMAP sending.
 - Fullscreen terminal UI with list, preview, filters, account cycling, async sync/send, reply/reply-all/forward, spam/trash/unread, header view, attachment save/open/import.
+- Truecolor pixel-art rendering for CID-referenced PNG, JPEG, and GIF images directly in the message preview.
 - Compose flow through `$VISUAL` or `$EDITOR`.
 - PGP support through `gpg`: decrypt/verify on open, encrypt/sign/self-encrypt/attach-public-key while composing.
 - Address index built from all seen mail identities, exposed through `murat lsp` for editor completion in compose drafts.
@@ -125,6 +126,8 @@ Useful keys:
 - `a`: cycle accounts
 - `q`: back or quit
 
+CID-referenced images in HTML mail are rendered at their document position using ANSI half-block pixels. Images preserve their aspect ratio, are never upscaled, and are bounded to 48 columns and 24 terminal rows. Source width is always capped at eight pixels per terminal column so small icons stay compact, including when HTML dimensions are present. Click a rendered image to open its MIME attachment with the system handler. Ordinary image attachments remain in the attachment menu.
+
 Message action menu:
 
 - `r`: reply
@@ -205,6 +208,7 @@ language-servers = ["murat"]
 
 ## Security Notes
 
+- Inline image rendering only decodes image data already present in the local MIME message. It never fetches remote or data-URL image sources, and applies count, byte-size, dimension, and decoded-pixel limits.
 - Local store encryption depends on local key-file protection and local machine security; `murat init --gpg-key KEY` and `murat import --gpg-key KEY` wrap that local key with GPG.
 - Account secrets are stored inside the encrypted account store.
 - `murat export` writes account secrets and GPG secret keys into one archive encrypted by the backup passphrase you enter; `murat import` prompts for the same passphrase.

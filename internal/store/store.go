@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"mime/quotedprintable"
 	"net/mail"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -128,10 +129,24 @@ func (m Message) MarshalJSON() ([]byte, error) {
 }
 
 type Body struct {
-	Headers   string `json:"headers"`
-	Text      string `json:"text"`
-	RawSize   int    `json:"raw_size"`
-	FetchedAt string `json:"fetched_at"`
+	Headers   string     `json:"headers"`
+	Text      string     `json:"text"`
+	RawSize   int        `json:"raw_size"`
+	FetchedAt string     `json:"fetched_at"`
+	Parts     []BodyPart `json:"-"`
+}
+
+type BodyPart struct {
+	Text  string
+	Image *InlineImage
+}
+
+type InlineImage struct {
+	ContentID   string
+	Filename    string
+	ContentType string
+	Alt         string
+	Data        []byte
 }
 
 type Attachment struct {
@@ -139,6 +154,8 @@ type Attachment struct {
 	ContentType string
 	Size        int
 	Data        []byte
+	ContentID   string
+	Inline      bool
 }
 
 type DraftData struct {
@@ -742,7 +759,8 @@ func (s *Store) OpenBody(msg *Message) (*Body, error) {
 	if changed {
 		s.MarkDirty()
 	}
-	body := Body{Headers: headerText(raw), Text: text, RawSize: len(raw), FetchedAt: time.Now().UTC().Format(time.RFC3339)}
+	parts, _ := inlineBodyParts(raw)
+	body := Body{Headers: headerText(raw), Text: text, RawSize: len(raw), FetchedAt: time.Now().UTC().Format(time.RFC3339), Parts: parts}
 	return &body, nil
 }
 
@@ -2126,7 +2144,12 @@ func extractAttachments(header mail.Header, body io.Reader, out *[]Attachment) e
 				if strings.TrimSpace(filename) == "" {
 					filename = inlineAttachmentName(mail.Header(part.Header), partType, len(*out)+1)
 				}
-				*out = append(*out, Attachment{Filename: filename, ContentType: partType, Size: len(data), Data: data})
+				contentID := normalizeContentID(firstNonEmptyHeader(mail.Header(part.Header), "Content-ID", "X-Attachment-Id"))
+				*out = append(*out, Attachment{
+					Filename: filename, ContentType: partType, Size: len(data), Data: data,
+					ContentID: contentID,
+					Inline:    strings.EqualFold(disposition, "inline") || contentID != "",
+				})
 				continue
 			}
 			if strings.HasPrefix(strings.ToLower(partType), "multipart/") {
@@ -2176,6 +2199,75 @@ func inlineAttachmentName(header mail.Header, mediaType string, index int) strin
 		}
 	}
 	return name
+}
+
+func firstNonEmptyHeader(header mail.Header, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func normalizeContentID(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(strings.ToLower(value), "cid:") {
+		value = value[4:]
+	}
+	if decoded, err := url.PathUnescape(value); err == nil {
+		value = decoded
+	}
+	return strings.ToLower(strings.Trim(strings.TrimSpace(value), "<>"))
+}
+
+func inlineBodyParts(raw []byte) ([]BodyPart, error) {
+	attachmentMessage, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	attachments := []Attachment{}
+	if err := extractAttachments(attachmentMessage.Header, attachmentMessage.Body, &attachments); err != nil {
+		return nil, err
+	}
+	images := map[string]Attachment{}
+	for _, attachment := range attachments {
+		if attachment.Inline && attachment.ContentID != "" && inlineImagePart(attachment.ContentType) {
+			images[attachment.ContentID] = attachment
+		}
+	}
+	if len(images) == 0 {
+		return nil, nil
+	}
+
+	bodyMessage, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	html, err := extractHTMLBody(bodyMessage.Header, bodyMessage.Body)
+	if err != nil || strings.TrimSpace(html) == "" {
+		return nil, err
+	}
+	return htmlToBodyParts(html, images), nil
+}
+
+func extractHTMLBody(header mail.Header, body io.Reader) (string, error) {
+	mediaType, params, _ := mime.ParseMediaType(header.Get("Content-Type"))
+	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		if params["boundary"] == "" {
+			return "", nil
+		}
+		_, html, _, err := extractMultipart(multipart.NewReader(body, params["boundary"]))
+		return html, err
+	}
+	if !strings.EqualFold(mediaType, "text/html") {
+		return "", nil
+	}
+	data, err := readDecoded(body, header.Get("Content-Transfer-Encoding"))
+	if err != nil {
+		return "", err
+	}
+	return decodeBytes(repairMissingQuotedPrintable(data), params["charset"]), nil
 }
 
 func readDecoded(reader io.Reader, encoding string) ([]byte, error) {
@@ -2272,14 +2364,43 @@ var htmlNewlineSpaceRE = regexp.MustCompile(` *\n *`)
 var htmlManyNewlinesRE = regexp.MustCompile(`\n{3,}`)
 var htmlStyleRE = regexp.MustCompile(`(?is)\bstyle\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
 var htmlHrefRE = regexp.MustCompile(`(?is)\bhref\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
+var htmlSrcRE = regexp.MustCompile(`(?is)\bsrc\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
+var htmlAltRE = regexp.MustCompile(`(?is)\balt\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
 var htmlFontWeightRE = regexp.MustCompile(`font-weight\s*:\s*[6-9]00`)
 
 func htmlToRichText(value string) string {
-	text, ok := extractHTMLRichText(value)
+	text, _, ok := extractHTMLRichBody(value, nil)
 	if !ok {
 		return stripHTML(value)
 	}
 	return text
+}
+
+func htmlToBodyParts(value string, images map[string]Attachment) []BodyPart {
+	text, inlineImages, ok := extractHTMLRichBody(value, images)
+	if !ok || len(inlineImages) == 0 {
+		return nil
+	}
+	parts := []BodyPart{}
+	start := 0
+	for i := range inlineImages {
+		marker := inlineImageMarker(i)
+		at := strings.Index(text[start:], marker)
+		if at < 0 {
+			continue
+		}
+		at += start
+		if value := strings.Trim(text[start:at], "\n"); value != "" {
+			parts = append(parts, BodyPart{Text: value})
+		}
+		image := inlineImages[i]
+		parts = append(parts, BodyPart{Image: &image})
+		start = at + len(marker)
+	}
+	if value := strings.Trim(text[start:], "\n"); value != "" {
+		parts = append(parts, BodyPart{Text: value})
+	}
+	return parts
 }
 
 type htmlMarkers struct {
@@ -2290,8 +2411,14 @@ type htmlMarkers struct {
 }
 
 func extractHTMLRichText(value string) (string, bool) {
+	text, _, ok := extractHTMLRichBody(value, nil)
+	return text, ok
+}
+
+func extractHTMLRichBody(value string, images map[string]Attachment) (string, []InlineImage, bool) {
 	var out strings.Builder
 	stack := []htmlMarkers{}
+	inlineImages := []InlineImage{}
 	skipDepth := 0
 	for i := 0; i < len(value); {
 		if value[i] != '<' {
@@ -2309,7 +2436,7 @@ func extractHTMLRichText(value string) (string, bool) {
 		}
 		end := strings.IndexByte(value[i:], '>')
 		if end < 0 {
-			return "", false
+			return "", nil, false
 		}
 		end += i
 		tagText := strings.TrimSpace(value[i+1 : end])
@@ -2359,6 +2486,33 @@ func extractHTMLRichText(value string) (string, bool) {
 			htmlNewline(&out)
 			continue
 		}
+		if tag == "img" && images != nil {
+			src := htmlpkg.UnescapeString(htmlAttrValue(tagText, htmlSrcRE))
+			contentID := normalizeContentID(src)
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(src)), "cid:") {
+				if attachment, exists := images[contentID]; exists {
+					for j := len(stack) - 1; j >= 0; j-- {
+						writeHTMLMarkerClose(&out, stack[j])
+					}
+					htmlNewline(&out)
+					out.WriteString(inlineImageMarker(len(inlineImages)))
+					out.WriteByte('\n')
+					for _, markers := range stack {
+						writeHTMLMarkerOpen(&out, markers)
+					}
+					inlineImages = append(inlineImages, InlineImage{
+						ContentID:   attachment.ContentID,
+						Filename:    attachment.Filename,
+						ContentType: attachment.ContentType,
+						Alt:         strings.TrimSpace(htmlpkg.UnescapeString(htmlAttrValue(tagText, htmlAltRE))),
+						Data:        append([]byte(nil), attachment.Data...),
+					})
+				} else if alt := strings.TrimSpace(htmlpkg.UnescapeString(htmlAttrValue(tagText, htmlAltRE))); alt != "" {
+					out.WriteString("[image: " + alt + "]")
+				}
+			}
+			continue
+		}
 		if htmlBlockTags[tag] {
 			htmlNewline(&out)
 			if tag == "li" {
@@ -2384,7 +2538,11 @@ func extractHTMLRichText(value string) (string, bool) {
 	text = htmlSpaceRE.ReplaceAllString(text, " ")
 	text = htmlNewlineSpaceRE.ReplaceAllString(text, "\n")
 	text = htmlManyNewlinesRE.ReplaceAllString(text, "\n\n")
-	return strings.TrimSpace(text), true
+	return strings.TrimSpace(text), inlineImages, true
+}
+
+func inlineImageMarker(index int) string {
+	return fmt.Sprintf("\x00murat-inline-image-%d\x00", index)
 }
 
 var htmlBlockTags = map[string]bool{

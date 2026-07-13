@@ -4,6 +4,11 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"mime"
 	"net/mail"
@@ -124,6 +129,7 @@ type App struct {
 	bodyScroll   int
 	preview      *store.Message
 	previewBody  string
+	previewParts []previewPart
 	previewHead  string
 	headerMode   bool
 	status       string
@@ -637,6 +643,7 @@ func (a *App) reload() {
 	if a.preview != nil && !messageInList(a.preview, a.messages) {
 		a.preview = nil
 		a.previewBody = ""
+		a.previewParts = nil
 		a.previewHead = ""
 		a.headerMode = false
 		a.bodyScroll = 0
@@ -976,6 +983,11 @@ func (a *App) handleMouse(key string) bool {
 		if release == "release" {
 			a.updateSelection(x, y)
 			if samePoint(a.selectStart, a.selectEnd) && pointInArea(x, y, a.bodyArea) {
+				if attachment, ok := a.imageAttachmentAtBodyPoint(x, y); ok {
+					a.clearSelection()
+					a.openAttachment(attachment)
+					return true
+				}
 				if url := a.linkAtBodyPoint(x, y); url != "" {
 					a.confirmLink(url)
 					return true
@@ -1087,15 +1099,31 @@ func samePoint(a, b *point) bool {
 	return a != nil && b != nil && a.line == b.line && a.col == b.col
 }
 
+func (a *App) imageAttachmentAtBodyPoint(x, y int) (store.Attachment, bool) {
+	if a.preview == nil || !pointInArea(x, y, a.bodyArea) {
+		return store.Attachment{}, false
+	}
+	lines := a.currentPreviewLines(a.bodyArea.w)
+	lineIndex := a.bodyScroll + max(0, min(max(0, a.bodyArea.h-1), y-a.bodyArea.y))
+	if lineIndex < 0 || lineIndex >= len(lines) {
+		return store.Attachment{}, false
+	}
+	line := lines[lineIndex]
+	if line.image == nil {
+		return store.Attachment{}, false
+	}
+	col := max(0, min(max(0, a.bodyArea.w-1), x-a.bodyArea.x))
+	if col >= len(line.pixels) {
+		return store.Attachment{}, false
+	}
+	return line.image.attachment, true
+}
+
 func (a *App) linkAtBodyPoint(x, y int) string {
 	if a.preview == nil || !pointInArea(x, y, a.bodyArea) {
 		return ""
 	}
-	content := a.previewBody
-	if a.headerMode {
-		content = a.previewHead
-	}
-	lines := previewLines(a.preview, content, a.bodyArea.w)
+	lines := a.currentPreviewLines(a.bodyArea.w)
 	lineIndex := a.bodyScroll + max(0, min(max(0, a.bodyArea.h-1), y-a.bodyArea.y))
 	if lineIndex < 0 || lineIndex >= len(lines) {
 		return ""
@@ -1130,11 +1158,7 @@ func (a *App) selectedText() string {
 	if pointLess(end, start) {
 		start, end = end, start
 	}
-	content := a.previewBody
-	if a.headerMode {
-		content = a.previewHead
-	}
-	lines := previewLines(a.preview, content, a.bodyArea.w)
+	lines := a.currentPreviewLines(a.bodyArea.w)
 	chunks := []string{}
 	for i := start.line; i <= end.line && i < len(lines); i++ {
 		text := previewPlainText(lines[i])
@@ -1182,11 +1206,7 @@ func (a *App) scrollBody(delta int) {
 	if a.preview == nil || a.bodyArea.h <= 0 {
 		return
 	}
-	content := a.previewBody
-	if a.headerMode {
-		content = a.previewHead
-	}
-	maxScroll := max(0, len(previewLines(a.preview, content, a.bodyArea.w))-a.bodyArea.h)
+	maxScroll := max(0, len(a.currentPreviewLines(a.bodyArea.w))-a.bodyArea.h)
 	a.bodyScroll += delta
 	if a.bodyScroll < 0 {
 		a.bodyScroll = 0
@@ -1320,11 +1340,15 @@ func (a *App) openSelected() {
 	a.preview = msg
 	a.previewHead = body.Headers
 	text, status, _ := pgp.ProcessTextWithKeys(body.Text, a.publicKeyAttachments(msg))
+	a.previewParts = preparePreviewParts(body.Parts)
 	if report := a.aggregateReportPreview(msg); report != "" {
 		if strings.TrimSpace(text) == "" {
 			text = report
 		} else {
 			text = report + "\n\n" + text
+		}
+		if len(a.previewParts) > 0 {
+			a.previewParts = append([]previewPart{{text: report}}, a.previewParts...)
 		}
 	}
 	a.previewBody = text
@@ -1732,6 +1756,7 @@ func (a *App) viewAttachment(msg *store.Message, att store.Attachment) {
 	}
 	a.preview = msg
 	a.previewBody = decodeBytesForUI(att.Data, att.ContentType)
+	a.previewParts = nil
 	a.previewHead = ""
 	a.headerMode = false
 	a.bodyScroll = 0
@@ -2280,13 +2305,10 @@ func (a *App) drawPreview(y, x, height, width int) {
 	if height <= 0 || a.preview == nil {
 		return
 	}
-	content := a.previewBody
-	if a.headerMode {
-		content = a.previewHead
-	}
-	lines := previewLines(a.preview, content, width)
-	if a.bodyScroll > len(lines)-1 {
-		a.bodyScroll = max(0, len(lines)-1)
+	lines := a.currentPreviewLines(width)
+	maxScroll := max(0, len(lines)-height)
+	if a.bodyScroll > maxScroll {
+		a.bodyScroll = maxScroll
 	}
 	for row := 0; row < height; row++ {
 		if a.bodyScroll+row >= len(lines) {
@@ -2328,12 +2350,42 @@ func (a *App) selectionRangeForLine(index int, line previewLine) ([2]int, bool) 
 	return [2]int{left, right}, true
 }
 
-type previewLine struct {
-	label string
-	value string
+const (
+	inlineImageMaxCount        = 8
+	inlineImageMaxBytes        = 10 << 20
+	inlineImageMaxTotalBytes   = 20 << 20
+	inlineImageMaxDimension    = 4096
+	inlineImageMaxPixels       = 16 << 20
+	inlineImageMaxColumns      = 48
+	inlineImageMaxTerminalRows = 24
+)
+
+type previewPart struct {
 	text  string
-	rich  richState
-	blank bool
+	image *previewImage
+}
+
+type previewImage struct {
+	source     image.Image
+	attachment store.Attachment
+	rows       map[int][][]pixelCell
+}
+
+type pixelCell struct {
+	top       color.NRGBA
+	bottom    color.NRGBA
+	topSet    bool
+	bottomSet bool
+}
+
+type previewLine struct {
+	label  string
+	value  string
+	text   string
+	rich   richState
+	pixels []pixelCell
+	image  *previewImage
+	blank  bool
 }
 
 type richState struct {
@@ -2342,9 +2394,18 @@ type richState struct {
 	under  bool
 }
 
-func previewLines(msg *store.Message, content string, width int) []previewLine {
-	content = normalizePreviewText(content)
-	rows := []previewLine{
+func (a *App) currentPreviewLines(width int) []previewLine {
+	if a.headerMode {
+		return previewLines(a.preview, a.previewHead, width)
+	}
+	if len(a.previewParts) > 0 {
+		return previewLinesWithParts(a.preview, a.previewParts, width)
+	}
+	return previewLines(a.preview, a.previewBody, width)
+}
+
+func previewHeaderLines(msg *store.Message) []previewLine {
+	return []previewLine{
 		{label: "Subject", value: msg.Subject},
 		{label: "From", value: msg.From},
 		{label: "To", value: strings.Join(msg.To, ", ")},
@@ -2352,6 +2413,11 @@ func previewLines(msg *store.Message, content string, width int) []previewLine {
 		{label: "Tags", value: strings.Join(msg.DisplayTags(), ", ")},
 		{blank: true},
 	}
+}
+
+func previewLines(msg *store.Message, content string, width int) []previewLine {
+	content = normalizePreviewText(content)
+	rows := previewHeaderLines(msg)
 	if strings.TrimSpace(content) == "" {
 		content = "(no body)"
 	}
@@ -2359,7 +2425,179 @@ func previewLines(msg *store.Message, content string, width int) []previewLine {
 	return rows
 }
 
+func previewLinesWithParts(msg *store.Message, parts []previewPart, width int) []previewLine {
+	rows := previewHeaderLines(msg)
+	bodyRows := 0
+	for _, part := range parts {
+		text := normalizePreviewText(part.text)
+		if strings.TrimSpace(richPlainText(text)) != "" {
+			lines := wrapPreviewContent(text, max(10, width-1))
+			rows = append(rows, lines...)
+			bodyRows += len(lines)
+		}
+		if part.image != nil {
+			for _, pixels := range part.image.rasterRows(width) {
+				rows = append(rows, previewLine{pixels: pixels, image: part.image})
+				bodyRows++
+			}
+		}
+	}
+	if bodyRows == 0 {
+		rows = append(rows, previewLine{text: "(no body)"})
+	}
+	return rows
+}
+
+func preparePreviewParts(parts []store.BodyPart) []previewPart {
+	out := []previewPart{}
+	imageCount := 0
+	totalBytes := 0
+	for _, part := range parts {
+		if strings.TrimSpace(part.Text) != "" {
+			out = append(out, previewPart{text: part.Text})
+		}
+		if part.Image == nil {
+			continue
+		}
+		fallback := inlineImageFallback(part.Image)
+		size := len(part.Image.Data)
+		if imageCount >= inlineImageMaxCount || size > inlineImageMaxBytes || totalBytes+size > inlineImageMaxTotalBytes {
+			out = append(out, previewPart{text: fallback})
+			continue
+		}
+		config, format, err := image.DecodeConfig(bytes.NewReader(part.Image.Data))
+		if err != nil || !supportedInlineImageFormat(format) || config.Width <= 0 || config.Height <= 0 ||
+			config.Width > inlineImageMaxDimension || config.Height > inlineImageMaxDimension ||
+			config.Width*config.Height > inlineImageMaxPixels {
+			out = append(out, previewPart{text: fallback})
+			continue
+		}
+		decoded, decodedFormat, err := image.Decode(bytes.NewReader(part.Image.Data))
+		if err != nil || decodedFormat != format {
+			out = append(out, previewPart{text: fallback})
+			continue
+		}
+		bounds := decoded.Bounds()
+		if bounds.Dx() <= 0 || bounds.Dy() <= 0 || bounds.Dx() > inlineImageMaxDimension ||
+			bounds.Dy() > inlineImageMaxDimension || bounds.Dx()*bounds.Dy() > inlineImageMaxPixels {
+			out = append(out, previewPart{text: fallback})
+			continue
+		}
+		imageCount++
+		totalBytes += size
+		attachment := store.Attachment{
+			Filename: part.Image.Filename, ContentType: part.Image.ContentType, Size: size,
+			Data: part.Image.Data, ContentID: part.Image.ContentID, Inline: true,
+		}
+		out = append(out, previewPart{image: &previewImage{
+			source: decoded, attachment: attachment, rows: map[int][][]pixelCell{},
+		}})
+	}
+	return out
+}
+
+func supportedInlineImageFormat(format string) bool {
+	switch strings.ToLower(format) {
+	case "png", "jpeg", "gif":
+		return true
+	default:
+		return false
+	}
+}
+
+func inlineImageFallback(value *store.InlineImage) string {
+	if value == nil {
+		return "[image unavailable]"
+	}
+	label := strings.TrimSpace(value.Alt)
+	if label == "" {
+		label = strings.TrimSpace(value.Filename)
+	}
+	label = stripInlineControlChars(label)
+	label = clipRunes(label, 80)
+	if label == "" {
+		return "[image unavailable]"
+	}
+	return "[image: " + label + "]"
+}
+
+func (value *previewImage) rasterRows(width int) [][]pixelCell {
+	if value == nil || value.source == nil || width <= 0 {
+		return nil
+	}
+	cacheKey := min(width, inlineImageMaxColumns)
+	if rows, ok := value.rows[cacheKey]; ok {
+		return rows
+	}
+	bounds := value.source.Bounds()
+	sourceWidth, sourceHeight := bounds.Dx(), bounds.Dy()
+	targetWidth, targetHeight := sourceWidth, sourceHeight
+	maxWidth := max(1, min(width, inlineImageMaxColumns))
+	maxWidth = max(1, min(maxWidth, sourceWidth/8))
+	maxPixelHeight := inlineImageMaxTerminalRows * 2
+	if targetWidth > maxWidth {
+		targetHeight = max(1, targetHeight*maxWidth/targetWidth)
+		targetWidth = maxWidth
+	}
+	if targetHeight > maxPixelHeight {
+		targetWidth = max(1, targetWidth*maxPixelHeight/targetHeight)
+		targetHeight = maxPixelHeight
+	}
+	rows := make([][]pixelCell, (targetHeight+1)/2)
+	for row := range rows {
+		rows[row] = make([]pixelCell, targetWidth)
+		for x := 0; x < targetWidth; x++ {
+			topY := row * 2
+			top := sampledPixel(value.source, bounds, x, topY, targetWidth, targetHeight)
+			rows[row][x].top = top
+			rows[row][x].topSet = top.A >= 128
+			if bottomY := topY + 1; bottomY < targetHeight {
+				bottom := sampledPixel(value.source, bounds, x, bottomY, targetWidth, targetHeight)
+				rows[row][x].bottom = bottom
+				rows[row][x].bottomSet = bottom.A >= 128
+			}
+		}
+	}
+	value.rows[cacheKey] = rows
+	return rows
+}
+
+func sampledPixel(source image.Image, bounds image.Rectangle, x, y, width, height int) color.NRGBA {
+	sourceX := bounds.Min.X + x*bounds.Dx()/width
+	sourceY := bounds.Min.Y + y*bounds.Dy()/height
+	return color.NRGBAModel.Convert(source.At(sourceX, sourceY)).(color.NRGBA)
+}
+
+func printPixelLine(y, x, width int, cells []pixelCell) {
+	if width <= 0 {
+		return
+	}
+	cells = cells[:min(len(cells), width)]
+	var out strings.Builder
+	fmt.Fprintf(&out, "\x1b[%d;%dH%s", y+1, x+1, styleReset)
+	for _, cell := range cells {
+		switch {
+		case cell.topSet && cell.bottomSet:
+			fmt.Fprintf(&out, "\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm▀",
+				cell.top.R, cell.top.G, cell.top.B, cell.bottom.R, cell.bottom.G, cell.bottom.B)
+		case cell.topSet:
+			fmt.Fprintf(&out, "\x1b[38;2;%d;%d;%d;49m▀", cell.top.R, cell.top.G, cell.top.B)
+		case cell.bottomSet:
+			fmt.Fprintf(&out, "\x1b[38;2;%d;%d;%d;49m▄", cell.bottom.R, cell.bottom.G, cell.bottom.B)
+		default:
+			out.WriteString(styleReset + " ")
+		}
+	}
+	out.WriteString(styleReset)
+	out.WriteString(strings.Repeat(" ", max(0, width-len(cells))))
+	fmt.Print(out.String())
+}
+
 func printPreviewLine(y, x, width int, line previewLine) {
+	if line.pixels != nil {
+		printPixelLine(y, x, width, line.pixels)
+		return
+	}
 	if line.blank {
 		printLine(y, x, width, "")
 		return
@@ -2399,7 +2637,7 @@ func printSelectedPreviewLine(y, x, width int, line previewLine, selected [2]int
 }
 
 func previewPlainText(line previewLine) string {
-	if line.blank {
+	if line.pixels != nil || line.blank {
 		return ""
 	}
 	if line.label != "" {
@@ -2409,7 +2647,7 @@ func previewPlainText(line previewLine) string {
 }
 
 func previewLinks(line previewLine) []markdownLink {
-	if line.blank || line.label != "" {
+	if line.pixels != nil || line.blank || line.label != "" {
 		return nil
 	}
 	return markdownLinks(line.text)
