@@ -103,3 +103,34 @@ func TestSMTPOAuthScopesAddsSend(t *testing.T) {
 		t.Fatalf("scopes = %#v", scopes)
 	}
 }
+
+func TestRecipientsUseEnvelopeAddressesWithoutDisplayNames(t *testing.T) {
+	draft := Draft{
+		To:  "Sabine Klabisch <sabine.klabisch@stuck-lehnert.de>, Silvia Müller <silvia.mueller@stuck-lehnert.de>",
+		Cc:  "\"Müller, Max\" <max.mueller@example.com>",
+		Bcc: "hidden@example.com",
+	}
+	got := recipients(draft)
+	want := []string{
+		"sabine.klabisch@stuck-lehnert.de",
+		"silvia.mueller@stuck-lehnert.de",
+		"max.mueller@example.com",
+		"hidden@example.com",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("recipients = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("recipient[%d] = %q, want %q; all = %#v", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestMessageHeadersKeepRecipientDisplayNames(t *testing.T) {
+	to := "Sabine Klabisch <sabine.klabisch@stuck-lehnert.de>, Silvia Müller <silvia.mueller@stuck-lehnert.de>"
+	message := Message(store.Account{Email: "sender@example.com"}, Draft{To: to, Body: "body"})
+	if !strings.Contains(message, "To: "+to) {
+		t.Fatalf("message lost display names:\n%s", message)
+	}
+}

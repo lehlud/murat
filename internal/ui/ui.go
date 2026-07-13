@@ -2260,13 +2260,13 @@ func (a *App) drawList(y, x, height, width int) {
 		return
 	}
 	if len(a.messages) == 0 {
-		if a.filter == "search" {
-			for row := 0; row < height; row++ {
-				printLine(y+row, x, width, "")
+		for row := 0; row < height; row++ {
+			text := ""
+			if row == 0 && a.filter != "search" {
+				text = "no mail; press " + a.keys.Sync + " to sync"
 			}
-			return
+			printLine(y+row, x, width, text)
 		}
-		printLine(y, x, width, "no mail; press "+a.keys.Sync+" to sync")
 		return
 	}
 	if a.selected < a.scroll {

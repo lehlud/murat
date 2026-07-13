@@ -1088,6 +1088,18 @@ func printMicrosoftClientIDHelp() {
 	fmt.Println("     " + helpStyle("33", oauth.ScopeMicrosoftIMAP))
 	fmt.Println("     " + helpStyle("33", oauth.ScopeMicrosoftSMTP))
 	fmt.Println("  " + helpStyle("36", "6.") + " Copy Application (client) ID")
+	fmt.Println("  " + helpStyle("36", "7.") + " Enable Authenticated SMTP for the mailbox:")
+	fmt.Println("     Microsoft 365 admin center -> Users -> Active users -> user -> Mail")
+	fmt.Println("     -> Manage email apps -> Authenticated SMTP")
+	fmt.Println("     or Exchange Online PowerShell:")
+	fmt.Println("     " + helpStyle("33", "Set-CASMailbox -Identity <mailbox> -SmtpClientAuthenticationDisabled $false"))
+	fmt.Println("  " + helpStyle("36", "8.") + " If SMTP AUTH is disabled for the tenant:")
+	fmt.Println("     " + helpStyle("33", "Get-TransportConfig | Format-List SmtpClientAuthenticationDisabled"))
+	fmt.Println("     Prefer the mailbox override above; only enable tenant-wide if intended:")
+	fmt.Println("     " + helpStyle("33", "Set-TransportConfig -SmtpClientAuthenticationDisabled $false"))
+	fmt.Println("     Microsoft Entra Security Defaults also disables SMTP AUTH and must be")
+	fmt.Println("     disabled or replaced with suitable Conditional Access before SMTP AUTH works.")
+	fmt.Println("     " + helpStyle("2", "https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/authenticated-client-smtp-submission"))
 	fmt.Println()
 }
 

@@ -70,6 +70,24 @@ delegated `https://outlook.office.com/IMAP.AccessAsUser.All` and
 murat account add-exchange-online --email you@example.com --oauth-client-id CLIENT_ID
 ```
 
+Exchange Online controls SMTP AUTH separately from the Entra application permissions. Enable **Authenticated SMTP** only for the mailbox that Murat uses:
+
+- Microsoft 365 admin center -> Users -> Active users -> select the user -> Mail -> Manage email apps -> enable **Authenticated SMTP**.
+- Or use Exchange Online PowerShell:
+
+```powershell
+Get-CASMailbox -Identity you@example.com | Format-List SmtpClientAuthenticationDisabled
+Set-CASMailbox -Identity you@example.com -SmtpClientAuthenticationDisabled $false
+```
+
+If sending still reports `SmtpClientAuthentication is disabled for this tenant`, inspect the organization setting:
+
+```powershell
+Get-TransportConfig | Format-List SmtpClientAuthenticationDisabled
+```
+
+The mailbox setting above overrides the normal organization-wide setting and is preferred over broadly enabling SMTP AUTH. If you intentionally need to enable it tenant-wide, use `Set-TransportConfig -SmtpClientAuthenticationDisabled $false`. Microsoft Entra Security Defaults disables SMTP AUTH regardless; using SMTP AUTH requires disabling Security Defaults and replacing its protections appropriately. See [Microsoft's SMTP AUTH configuration guide](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/authenticated-client-smtp-submission).
+
 Or add a JMAP account:
 
 ```sh

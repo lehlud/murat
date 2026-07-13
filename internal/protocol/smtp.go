@@ -312,8 +312,23 @@ func recipients(draft Draft) []string {
 	values := []string{draft.To, draft.Cc, draft.Bcc}
 	out := []string{}
 	for _, value := range values {
+		value = cleanHeaderValue(value)
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if addresses, err := mail.ParseAddressList(value); err == nil {
+			for _, address := range addresses {
+				if email := cleanHeaderValue(strings.TrimSpace(address.Address)); email != "" {
+					out = append(out, email)
+				}
+			}
+			continue
+		}
 		for _, item := range strings.Split(value, ",") {
 			item = cleanHeaderValue(strings.TrimSpace(item))
+			if address, err := mail.ParseAddress(item); err == nil {
+				item = cleanHeaderValue(strings.TrimSpace(address.Address))
+			}
 			if item != "" {
 				out = append(out, item)
 			}
