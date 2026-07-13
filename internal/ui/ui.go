@@ -865,6 +865,10 @@ func (a *App) handleDraftAction(key string, msg *store.Message) {
 }
 
 func (a *App) handleFilterAction(key string) {
+	if isDaysFilterKey(key) {
+		a.daysFilterPromptInitial(key)
+		return
+	}
 	switch key {
 	case "esc", "q", "f":
 		a.actionScope = ""
@@ -1223,7 +1227,11 @@ func (a *App) setDaysFilter(days int) {
 }
 
 func (a *App) daysFilterPrompt() {
-	value, err := a.promptLine("days (0=today)")
+	a.daysFilterPromptInitial("")
+}
+
+func (a *App) daysFilterPromptInitial(initial string) {
+	value, _, err := a.promptInput("days (0=today): ", initial, nil)
 	a.actionScope = ""
 	if err != nil {
 		a.statusError(err.Error())
@@ -1240,6 +1248,10 @@ func (a *App) daysFilterPrompt() {
 		return
 	}
 	a.setDaysFilter(days)
+}
+
+func isDaysFilterKey(key string) bool {
+	return len(key) == 1 && key[0] >= '0' && key[0] <= '9'
 }
 
 func daysFilterName(days int) string {
@@ -2411,7 +2423,7 @@ func (a *App) shortcuts() string {
 		return "mail: r reply  R reply-all  f forward  h headers  a attach  u unread  t trash  s spam  esc back"
 	}
 	if a.actionScope == "filter" {
-		return "filter: s spam  m dmarc  t trash  e sent  D drafts  r read  u unread  n days  c clear  esc back"
+		return "filter: digits days  s spam  m dmarc  t trash  e sent  D drafts  r read  u unread  c clear  esc back"
 	}
 	if a.actionScope == "link" {
 		return "link: enter open  c copy  esc cancel"

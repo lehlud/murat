@@ -534,6 +534,19 @@ func TestAutoScrollSelectionExtendsAtPreviewBottom(t *testing.T) {
 	}
 }
 
+func TestDaysFilterKey(t *testing.T) {
+	for _, key := range []string{"0", "1", "9"} {
+		if !isDaysFilterKey(key) {
+			t.Fatalf("expected %q to start days filter", key)
+		}
+	}
+	for _, key := range []string{"", "10", "n", "D"} {
+		if isDaysFilterKey(key) {
+			t.Fatalf("unexpected days filter key %q", key)
+		}
+	}
+}
+
 func TestMessageWithinDays(t *testing.T) {
 	now := time.Now().UTC()
 	if !messageWithinDays(&store.Message{ReceivedAt: now.Format(time.RFC3339)}, 0) {
