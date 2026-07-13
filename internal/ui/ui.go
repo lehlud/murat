@@ -3,6 +3,7 @@ package ui
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
@@ -2477,6 +2478,9 @@ func preparePreviewParts(parts []store.BodyPart) []previewPart {
 			out = append(out, previewPart{text: fallback})
 			continue
 		}
+		if decodedFormat == "jpeg" {
+			decoded = applyImageOrientation(decoded, jpegEXIFOrientation(part.Image.Data))
+		}
 		bounds := decoded.Bounds()
 		if bounds.Dx() <= 0 || bounds.Dy() <= 0 || bounds.Dx() > inlineImageMaxDimension ||
 			bounds.Dy() > inlineImageMaxDimension || bounds.Dx()*bounds.Dy() > inlineImageMaxPixels {
@@ -2494,6 +2498,150 @@ func preparePreviewParts(parts []store.BodyPart) []previewPart {
 		}})
 	}
 	return out
+}
+
+type orientedImage struct {
+	source      image.Image
+	orientation int
+}
+
+func applyImageOrientation(source image.Image, orientation int) image.Image {
+	if source == nil || orientation < 2 || orientation > 8 {
+		return source
+	}
+	return &orientedImage{source: source, orientation: orientation}
+}
+
+func (value *orientedImage) ColorModel() color.Model {
+	return value.source.ColorModel()
+}
+
+func (value *orientedImage) Bounds() image.Rectangle {
+	bounds := value.source.Bounds()
+	if value.orientation >= 5 {
+		return image.Rect(0, 0, bounds.Dy(), bounds.Dx())
+	}
+	return image.Rect(0, 0, bounds.Dx(), bounds.Dy())
+}
+
+func (value *orientedImage) At(x, y int) color.Color {
+	if value == nil || value.source == nil || !image.Pt(x, y).In(value.Bounds()) {
+		return color.NRGBA{}
+	}
+	bounds := value.source.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	sourceX, sourceY := x, y
+	switch value.orientation {
+	case 2:
+		sourceX = width - 1 - x
+	case 3:
+		sourceX, sourceY = width-1-x, height-1-y
+	case 4:
+		sourceY = height - 1 - y
+	case 5:
+		sourceX, sourceY = y, x
+	case 6:
+		sourceX, sourceY = y, height-1-x
+	case 7:
+		sourceX, sourceY = width-1-y, height-1-x
+	case 8:
+		sourceX, sourceY = width-1-y, x
+	}
+	return value.source.At(bounds.Min.X+sourceX, bounds.Min.Y+sourceY)
+}
+
+func jpegEXIFOrientation(data []byte) int {
+	if len(data) < 4 || data[0] != 0xff || data[1] != 0xd8 {
+		return 1
+	}
+	for offset := 2; offset < len(data); {
+		if data[offset] != 0xff {
+			return 1
+		}
+		for offset < len(data) && data[offset] == 0xff {
+			offset++
+		}
+		if offset >= len(data) {
+			return 1
+		}
+		marker := data[offset]
+		offset++
+		if marker == 0xd9 || marker == 0xda {
+			return 1
+		}
+		if marker == 0x01 || marker >= 0xd0 && marker <= 0xd7 {
+			continue
+		}
+		if offset+2 > len(data) {
+			return 1
+		}
+		length := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+		if length < 2 || offset+length > len(data) {
+			return 1
+		}
+		payload := data[offset+2 : offset+length]
+		if marker == 0xe1 {
+			if orientation := exifOrientation(payload); orientation != 1 {
+				return orientation
+			}
+		}
+		offset += length
+	}
+	return 1
+}
+
+func exifOrientation(payload []byte) int {
+	if len(payload) < 14 || !bytes.Equal(payload[:6], []byte{'E', 'x', 'i', 'f', 0, 0}) {
+		return 1
+	}
+	tiff := payload[6:]
+	var order binary.ByteOrder
+	switch string(tiff[:2]) {
+	case "II":
+		order = binary.LittleEndian
+	case "MM":
+		order = binary.BigEndian
+	default:
+		return 1
+	}
+	if order.Uint16(tiff[2:4]) != 42 {
+		return 1
+	}
+	ifdOffset := uint64(order.Uint32(tiff[4:8]))
+	if ifdOffset+2 > uint64(len(tiff)) {
+		return 1
+	}
+	entryCount := uint64(order.Uint16(tiff[ifdOffset : ifdOffset+2]))
+	entriesAt := ifdOffset + 2
+	if entriesAt+entryCount*12 > uint64(len(tiff)) {
+		return 1
+	}
+	for index := uint64(0); index < entryCount; index++ {
+		entryAt := entriesAt + index*12
+		entry := tiff[entryAt : entryAt+12]
+		if order.Uint16(entry[0:2]) != 0x0112 || order.Uint16(entry[2:4]) != 3 {
+			continue
+		}
+		count := uint64(order.Uint32(entry[4:8]))
+		if count == 0 {
+			return 1
+		}
+		var orientation uint16
+		if count <= 2 {
+			orientation = order.Uint16(entry[8:10])
+		} else {
+			valueAt := uint64(order.Uint32(entry[8:12]))
+			if valueAt+2 > uint64(len(tiff)) {
+				return 1
+			}
+			orientation = order.Uint16(tiff[valueAt : valueAt+2])
+		}
+		if orientation >= 1 && orientation <= 8 {
+			return int(orientation)
+		}
+		return 1
+	}
+	return 1
 }
 
 func supportedInlineImageFormat(format string) bool {

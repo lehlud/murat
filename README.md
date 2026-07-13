@@ -126,7 +126,7 @@ Useful keys:
 - `a`: cycle accounts
 - `q`: back or quit
 
-CID-referenced images in HTML mail are rendered at their document position using ANSI half-block pixels. Images preserve their aspect ratio, are never upscaled, and are bounded to 48 columns and 24 terminal rows. Source width is always capped at eight pixels per terminal column so small icons stay compact, including when HTML dimensions are present. Click a rendered image to open its MIME attachment with the system handler. Ordinary image attachments remain in the attachment menu.
+CID-referenced images in HTML mail are rendered at their document position using ANSI half-block pixels. Images preserve their aspect ratio, are never upscaled, and are bounded to 48 columns and 24 terminal rows. Source width is always capped at eight pixels per terminal column so small icons stay compact, including when HTML dimensions are present. JPEG EXIF orientation is applied before rendering. Click a rendered image to open its MIME attachment with the system handler. Ordinary image attachments remain in the attachment menu.
 
 Message action menu:
 

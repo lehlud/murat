@@ -2,8 +2,10 @@ package ui
 
 import (
 	"bytes"
+	"encoding/binary"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"image/png"
 	"strings"
 	"testing"
@@ -177,4 +179,82 @@ func TestImageAttachmentHitTargetUsesRenderedBounds(t *testing.T) {
 	if _, ok := app.imageAttachmentAtBodyPoint(app.bodyArea.x, app.bodyArea.y+imageLine-1); ok {
 		t.Fatal("text row above image was clickable")
 	}
+}
+
+func TestJPEGEXIFOrientationRotatesDecodedImage(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 16, 24))
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, source, nil); err != nil {
+		t.Fatal(err)
+	}
+	data := withJPEGEXIFOrientation(encoded.Bytes(), 6, binary.BigEndian)
+	if got := jpegEXIFOrientation(data); got != 6 {
+		t.Fatalf("orientation = %d, want 6", got)
+	}
+	parts := preparePreviewParts([]store.BodyPart{{Image: &store.InlineImage{
+		Filename: "phone.jpg", ContentType: "image/jpeg", Data: data,
+	}}})
+	if len(parts) != 1 || parts[0].image == nil {
+		t.Fatalf("parts = %#v", parts)
+	}
+	if bounds := parts[0].image.source.Bounds(); bounds.Dx() != 24 || bounds.Dy() != 16 {
+		t.Fatalf("oriented bounds = %v, want 24x16", bounds)
+	}
+}
+
+func TestJPEGEXIFOrientationSupportsLittleEndian(t *testing.T) {
+	data := append([]byte{0xff, 0xd8}, exifOrientationSegment(8, binary.LittleEndian)...)
+	data = append(data, 0xff, 0xd9)
+	if got := jpegEXIFOrientation(data); got != 8 {
+		t.Fatalf("orientation = %d, want 8", got)
+	}
+}
+
+func TestApplyImageOrientationSixMapsPixelsClockwise(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 2, 3))
+	for y := 0; y < 3; y++ {
+		for x := 0; x < 2; x++ {
+			source.SetNRGBA(x, y, color.NRGBA{R: uint8(y*10 + x), A: 255})
+		}
+	}
+	oriented := applyImageOrientation(source, 6)
+	if bounds := oriented.Bounds(); bounds.Dx() != 3 || bounds.Dy() != 2 {
+		t.Fatalf("bounds = %v", bounds)
+	}
+	if got := color.NRGBAModel.Convert(oriented.At(0, 0)).(color.NRGBA).R; got != 20 {
+		t.Fatalf("top-left red = %d, want source bottom-left 20", got)
+	}
+	if got := color.NRGBAModel.Convert(oriented.At(2, 1)).(color.NRGBA).R; got != 1 {
+		t.Fatalf("bottom-right red = %d, want source top-right 1", got)
+	}
+}
+
+func withJPEGEXIFOrientation(data []byte, orientation uint16, order binary.ByteOrder) []byte {
+	if len(data) < 2 {
+		return data
+	}
+	out := append([]byte(nil), data[:2]...)
+	out = append(out, exifOrientationSegment(orientation, order)...)
+	return append(out, data[2:]...)
+}
+
+func exifOrientationSegment(orientation uint16, order binary.ByteOrder) []byte {
+	tiff := make([]byte, 26)
+	if order == binary.LittleEndian {
+		copy(tiff[:2], "II")
+	} else {
+		copy(tiff[:2], "MM")
+	}
+	order.PutUint16(tiff[2:4], 42)
+	order.PutUint32(tiff[4:8], 8)
+	order.PutUint16(tiff[8:10], 1)
+	order.PutUint16(tiff[10:12], 0x0112)
+	order.PutUint16(tiff[12:14], 3)
+	order.PutUint32(tiff[14:18], 1)
+	order.PutUint16(tiff[18:20], orientation)
+	order.PutUint32(tiff[22:26], 0)
+	payload := append([]byte{'E', 'x', 'i', 'f', 0, 0}, tiff...)
+	segment := []byte{0xff, 0xe1, 0, 0}
+	binary.BigEndian.PutUint16(segment[2:4], uint16(len(payload)+2))
+	return append(segment, payload...)
 }
