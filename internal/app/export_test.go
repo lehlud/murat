@@ -25,22 +25,21 @@ func TestWriteExportTarIncludesExpectedFiles(t *testing.T) {
 		KnownAddresses: []store.KnownAddress{{Name: "Alice", Email: "alice@example.com", Count: 3}},
 		PublicKeys:     []byte("public keys"),
 		SecretKeys:     []byte("secret keys"),
-		OwnerTrust:     []byte("owner trust"),
 	}
 	var buf bytes.Buffer
 	if err := writeExportTarAt(&buf, data, time.Unix(0, 0).UTC()); err != nil {
 		t.Fatal(err)
 	}
 	files := readTarFiles(t, buf.Bytes())
-	for _, name := range []string{"manifest.json", "accounts.json", "known-addresses.json", "gpg/public.asc", "gpg/secret.asc", "gpg/ownertrust.txt"} {
+	for _, name := range []string{"manifest.json", "accounts.json", "known-addresses.json", "pgp/public.asc", "pgp/secret.asc"} {
 		if _, ok := files[name]; !ok {
 			t.Fatalf("missing tar file %s", name)
 		}
 	}
-	if got := string(files["gpg/public.asc"]); got != "public keys" {
+	if got := string(files["pgp/public.asc"]); got != "public keys" {
 		t.Fatalf("public keys = %q", got)
 	}
-	if got := string(files["gpg/secret.asc"]); got != "secret keys" {
+	if got := string(files["pgp/secret.asc"]); got != "secret keys" {
 		t.Fatalf("secret keys = %q", got)
 	}
 
@@ -63,7 +62,7 @@ func TestWriteExportTarIncludesExpectedFiles(t *testing.T) {
 
 func TestCmdExportRefusesOverwriteBeforeCollectingData(t *testing.T) {
 	dir := t.TempDir()
-	output := filepath.Join(dir, "backup.tar.gpg")
+	output := filepath.Join(dir, "backup.murat")
 	if err := os.WriteFile(output, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -96,13 +95,12 @@ func TestCmdExportRefusesOverwriteBeforeCollectingData(t *testing.T) {
 
 func TestCmdExportPassesDataToEncryptor(t *testing.T) {
 	dir := t.TempDir()
-	output := filepath.Join(dir, "backup.tar.gpg")
+	output := filepath.Join(dir, "backup.murat")
 	data := exportData{
 		Accounts:       []store.Account{{ID: "acct", Email: "me@example.com", Secret: "secret"}},
 		KnownAddresses: []store.KnownAddress{{Email: "alice@example.com"}},
 		PublicKeys:     []byte("pub"),
 		SecretKeys:     []byte("sec"),
-		OwnerTrust:     []byte("trust"),
 	}
 
 	oldCollect := collectExportData
@@ -135,15 +133,6 @@ func TestCmdExportPassesDataToEncryptor(t *testing.T) {
 	}
 	if _, err := os.Stat(output); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestGPGSymmetricEncryptArgsUseLoopbackPassphraseFD(t *testing.T) {
-	args := strings.Join(gpgSymmetricEncryptArgs("out.gpg"), " ")
-	for _, want := range []string{"--pinentry-mode loopback", "--passphrase-fd 3", "--symmetric", "--cipher-algo AES256", "--output out.gpg"} {
-		if !strings.Contains(args, want) {
-			t.Fatalf("args %q missing %q", args, want)
-		}
 	}
 }
 

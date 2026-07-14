@@ -8,11 +8,10 @@ import (
 )
 
 type Config struct {
-	UI     UIConfig
-	Theme  ThemeConfig
-	Keys   KeysConfig
-	Crypto CryptoConfig
-	PGP    PGPConfig
+	UI    UIConfig
+	Theme ThemeConfig
+	Keys  KeysConfig
+	PGP   PGPConfig
 }
 
 type UIConfig struct {
@@ -54,10 +53,6 @@ type KeysConfig struct {
 	CycleAccount string
 }
 
-type CryptoConfig struct {
-	GPGRecipient string
-}
-
 type PGPConfig struct {
 	Enabled         bool
 	Sign            bool
@@ -65,6 +60,7 @@ type PGPConfig struct {
 	EncryptToSelf   bool
 	AttachPublicKey bool
 	PublicKey       string
+	Identity        string
 }
 
 func Load(path string) (Config, error) {
@@ -196,7 +192,7 @@ func applyValue(cfg *Config, section, key, value string) error {
 		}
 	case "crypto":
 		if key == "gpg_recipient" {
-			cfg.Crypto.GPGRecipient = parseString(value)
+			cfg.PGP.Identity = parseString(value)
 		}
 	case "pgp":
 		switch key {
@@ -212,6 +208,8 @@ func applyValue(cfg *Config, section, key, value string) error {
 			return parseBool(value, &cfg.PGP.AttachPublicKey)
 		case "public_key":
 			cfg.PGP.PublicKey = parseString(value)
+		case "identity":
+			cfg.PGP.Identity = parseString(value)
 		}
 	}
 	return nil

@@ -1641,54 +1641,12 @@ func protocolDraftAttachments(attachments []store.Attachment) []protocol.Attachm
 }
 
 func (a *App) prepareDraftPGP(parsed protocol.Draft) (protocol.Draft, string, bool) {
-	identity := a.draftPGPIdentity(parsed)
-	if !pgp.DraftNeedsSigning(parsed) {
-		prepared, status, err := pgp.ApplyDraft(identity, parsed)
-		if err != nil {
-			a.statusError(err.Error())
-			return parsed, "", false
-		}
-		return prepared, status, true
-	}
-	needsPassphrase, err := pgp.SigningNeedsPassphrase(identity)
+	prepared, status, err := pgp.ApplyDraft(a.draftPGPIdentity(parsed), parsed)
 	if err != nil {
 		a.statusError(err.Error())
 		return parsed, "", false
 	}
-	if !needsPassphrase {
-		prepared, status, err := pgp.ApplyDraftWithOptions(identity, parsed, pgp.ApplyDraftOptions{LoopbackPinentry: true})
-		if err == nil {
-			return prepared, status, true
-		}
-		if !pgp.IsPassphraseRequired(err) {
-			a.statusError(err.Error())
-			return parsed, "", false
-		}
-	}
-	prompt := "GPG passphrase"
-	for {
-		passphrase, cancelled, err := a.promptSecret(prompt)
-		if err != nil {
-			a.statusError(err.Error())
-			return parsed, "", false
-		}
-		if cancelled {
-			a.status = "send cancelled"
-			a.error = false
-			return parsed, "", false
-		}
-		prepared, status, err := pgp.ApplyDraftWithOptions(identity, parsed, pgp.ApplyDraftOptions{LoopbackPinentry: true, Passphrase: passphrase})
-		clearSecretBytes(passphrase)
-		if err == nil {
-			return prepared, status, true
-		}
-		if pgp.IsPassphraseRequired(err) {
-			prompt = "GPG passphrase (try again)"
-			continue
-		}
-		a.statusError(err.Error())
-		return parsed, "", false
-	}
+	return prepared, status, true
 }
 
 func (a *App) attachmentMenu(msg *store.Message) {
@@ -1810,13 +1768,11 @@ func openExternal(target string) error {
 }
 
 func (a *App) importAttachmentKey(att store.Attachment) {
-	cmd := exec.Command("gpg", "--batch", "--yes", "--import")
-	cmd.Stdin = bytes.NewReader(att.Data)
-	if err := cmd.Run(); err != nil {
-		a.statusError("gpg import failed: " + err.Error())
+	if err := pgp.ImportKeyData(att.Data); err != nil {
+		a.statusError("PGP import failed: " + err.Error())
 		return
 	}
-	a.status = "imported public key"
+	a.status = "imported PGP key"
 }
 
 func (a *App) publicKeyAttachments(msg *store.Message) [][]byte {
@@ -3960,6 +3916,9 @@ func decodeBytesForUI(data []byte, contentType string) string {
 	}
 	charset = strings.ToLower(charset)
 	if charset == "iso-8859-1" || charset == "latin1" || charset == "latin-1" {
+		if utf8.Valid(data) {
+			return string(data)
+		}
 		runes := make([]rune, len(data))
 		for i, b := range data {
 			runes[i] = rune(b)

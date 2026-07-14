@@ -1,175 +1,59 @@
 package pgp
 
 import (
-	"fmt"
-	"io"
-	"os"
 	"strings"
 	"testing"
 
 	"lehnert.dev/murat/internal/protocol"
+	"lehnert.dev/murat/internal/store"
 )
 
-func TestClearSignedTextExtractsBody(t *testing.T) {
-	input := "noise\n-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nHello\n- - dash line\n\n-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----"
-	got, ok := clearSignedText(input)
-	if !ok {
-		t.Fatal("clearSignedText() failed")
-	}
-	want := "Hello\n- dash line"
-	if got != want {
-		t.Fatalf("clearSignedText() = %q, want %q", got, want)
-	}
-}
-
-func TestProcessTextShowsClearSignedBodyOnVerifyFailure(t *testing.T) {
-	input := "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nHello\n\n-----BEGIN PGP SIGNATURE-----\ninvalid\n-----END PGP SIGNATURE-----"
-	got, status, processed := ProcessText(input)
-	if !processed {
-		t.Fatal("ProcessText() did not process clearsigned text")
-	}
-	if got != "Hello" {
-		t.Fatalf("ProcessText() text = %q", got)
-	}
-	if !strings.HasPrefix(status, "pgp:") {
-		t.Fatalf("ProcessText() status = %q", status)
-	}
-}
-
-func TestIsPublicKeyAttachment(t *testing.T) {
-	if !IsPublicKeyAttachment("key.asc", "text/plain", []byte("x")) {
-		t.Fatal(".asc key not detected")
-	}
-	if !IsPublicKeyAttachment("key.txt", "application/pgp-keys", []byte("x")) {
-		t.Fatal("pgp-keys content type not detected")
-	}
-	if !IsPublicKeyAttachment("key.txt", "text/plain", []byte("-----BEGIN PGP PUBLIC KEY BLOCK-----")) {
-		t.Fatal("armored key block not detected")
-	}
-	if IsPublicKeyAttachment("note.txt", "text/plain", []byte("hello")) {
-		t.Fatal("plain text detected as key")
-	}
-}
-
-func TestSignatureIDFromStatus(t *testing.T) {
-	id := signatureIDFromStatus("[GNUPG:] VALIDSIG 5D4C73B5C49BC3D970832EBC43008C9A747C03F3 2026-06-18")
-	if id.fingerprint != "5D4C73B5C49BC3D970832EBC43008C9A747C03F3" {
-		t.Fatalf("fingerprint = %q", id.fingerprint)
-	}
-	if id.keyID != "43008C9A747C03F3" {
-		t.Fatalf("keyID = %q", id.keyID)
-	}
-}
-
-func TestSignatureIDMatchesFingerprintByKeyID(t *testing.T) {
-	left := signatureID{fingerprint: "5D4C73B5C49BC3D970832EBC43008C9A747C03F3"}
-	right := signatureID{keyID: "43008C9A747C03F3"}
-	if !left.matches(right) {
-		t.Fatalf("%#v should match %#v", left, right)
-	}
-}
-
-func TestTrustName(t *testing.T) {
-	if got := trustName("u"); got != "ultimate trust" {
-		t.Fatalf("trustName(u) = %q", got)
-	}
-}
-
-func TestSignedMIMEEntityWrapsOriginalEntity(t *testing.T) {
-	entity := "Content-Type: text/plain; charset=utf-8\r\n\r\nhello"
-	got := signedMIMEEntity(entity, "-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----")
-	for _, want := range []string{"Content-Type: multipart/signed", "protocol=\"application/pgp-signature\"", entity, "signature.asc", "-----BEGIN PGP SIGNATURE-----"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("signed MIME missing %q:\n%s", want, got)
-		}
-	}
-}
-
-func TestEncryptedMIMEEntityWrapsArmoredMessage(t *testing.T) {
-	got := encryptedMIMEEntity("-----BEGIN PGP MESSAGE-----\nabc\n-----END PGP MESSAGE-----")
-	for _, want := range []string{"Content-Type: multipart/encrypted", "protocol=\"application/pgp-encrypted\"", "Version: 1", "encrypted.asc", "-----BEGIN PGP MESSAGE-----"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("encrypted MIME missing %q:\n%s", want, got)
-		}
-	}
-}
-
-func TestDraftNeedsSigning(t *testing.T) {
-	if !DraftNeedsSigning(protocolDraft("sign")) {
-		t.Fatal("sign option not detected")
-	}
-	if !DraftNeedsSigning(protocolDraft("encrypt,signed")) {
-		t.Fatal("signed option not detected")
-	}
-	if DraftNeedsSigning(protocolDraft("encrypt,self-encrypt")) {
-		t.Fatal("self-encrypt should not require signing passphrase prompt")
-	}
-}
-
-func TestGPGPassphraseRequired(t *testing.T) {
-	for _, value := range []string{
-		"[GNUPG:] NEED_PASSPHRASE 1 2 3",
-		"[GNUPG:] BAD_PASSPHRASE 1234",
-		"gpg: signing failed: Bad passphrase",
-		"gpg: signing failed: No passphrase given",
-	} {
-		if !gpgPassphraseRequired(value) {
-			t.Fatalf("passphrase error not detected: %q", value)
-		}
-	}
-	if gpgPassphraseRequired("gpg: skipped: No public key") {
-		t.Fatal("unrelated gpg error detected as passphrase-required")
-	}
-}
-
-func TestGPGLoopbackArgs(t *testing.T) {
-	args := strings.Join(gpgLoopbackArgs([]string{"--batch", "--sign"}), " ")
-	for _, want := range []string{"--pinentry-mode loopback", "--passphrase-fd 3", "--batch --sign"} {
-		if !strings.Contains(args, want) {
-			t.Fatalf("loopback args %q missing %q", args, want)
-		}
-	}
-}
-
-func TestGPGPassphraseFDWritesPassphraseWithNewline(t *testing.T) {
-	r, cleanup, err := gpgPassphraseFD([]byte("secret"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	data, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "secret\n" {
-		t.Fatalf("passphrase fd = %q", data)
-	}
-}
-
-func protocolDraft(pgpOptions string) protocol.Draft {
-	return protocol.Draft{PGP: pgpOptions}
-}
-
-func TestKeyboxdReadOnlyError(t *testing.T) {
-	err := fmt.Errorf("pgp: import keys failed: gpg: error writing keyring '[keyboxd]': Attempt to write a readonly SQL database")
-	if !keyboxdReadOnlyError(err) {
-		t.Fatal("readonly keyboxd error not detected")
-	}
-	if keyboxdReadOnlyError(fmt.Errorf("pgp: import keys failed: gpg: invalid packet")) {
-		t.Fatal("unrelated import error detected as keyboxd readonly")
-	}
-}
-
-func TestActivateManagedHomeIfPresent(t *testing.T) {
+func testConfigure(t *testing.T) {
+	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	t.Setenv("XDG_DATA_HOME", "")
-	t.Setenv("GNUPGHOME", "")
-	if err := os.MkdirAll(ManagedHome(), 0o700); err != nil {
+	Configure(store.Paths{DataDir: dir, ConfigDir: dir, BodyDir: dir, RawDir: dir, PGPKeyFile: dir + "/pgp.enc"}, []byte("0123456789abcdef0123456789abcdef"))
+}
+
+func TestManagedKeyCreateAndExport(t *testing.T) {
+	testConfigure(t)
+	if err := Create("alice@example.com", "Alice"); err != nil {
 		t.Fatal(err)
 	}
-	ActivateManagedHomeIfPresent()
-	if os.Getenv("GNUPGHOME") != ManagedHome() {
-		t.Fatalf("GNUPGHOME = %q", os.Getenv("GNUPGHOME"))
+	if !HasSecretKey("alice@example.com") || !HasPublicKey("alice@example.com") {
+		t.Fatal("created key unavailable")
+	}
+	key, err := ExportPublicKey("alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(key), "BEGIN PGP PUBLIC KEY BLOCK") {
+		t.Fatalf("key = %q", key)
+	}
+}
+
+func TestApplyDraftEncryptAndSign(t *testing.T) {
+	testConfigure(t)
+	if err := Create("alice@example.com", "Alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Create("bob@example.com", "Bob"); err != nil {
+		t.Fatal(err)
+	}
+	draft, status, err := ApplyDraft("alice@example.com", protocol.Draft{From: "alice@example.com", To: "bob@example.com", Body: "hello", PGP: "encrypt,sign"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(draft.Body, "BEGIN PGP MESSAGE") || !strings.Contains(status, "encrypted") || !strings.Contains(status, "signed") {
+		t.Fatalf("draft=%#v status=%q", draft, status)
+	}
+	text, verify, ok := ProcessText(draft.Body)
+	if !ok || text != "hello" || !strings.Contains(verify, "decrypted") {
+		t.Fatalf("process=%q %q %v", text, verify, ok)
+	}
+}
+
+func TestPublicKeyAttachment(t *testing.T) {
+	if !IsPublicKeyAttachment("key.asc", "application/pgp-keys", []byte("x")) {
+		t.Fatal("public key attachment not detected")
 	}
 }

@@ -2,13 +2,10 @@ package app
 
 import (
 	"archive/tar"
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
 	"strings"
 
 	"lehnert.dev/murat/internal/pgp"
@@ -16,26 +13,23 @@ import (
 )
 
 type importOptions struct {
-	GPGRecipient    string
 	ReplaceAccounts bool
 }
 
 type importSummary struct {
-	Accounts        int
-	KnownAddresses  int
-	PublicKeyBytes  int
-	SecretKeyBytes  int
-	OwnerTrustBytes int
+	Accounts       int
+	KnownAddresses int
+	PublicKeyBytes int
+	SecretKeyBytes int
 }
 
 var (
-	readImportData  = gpgDecryptImportData
+	readImportData  = nativeDecryptImportData
 	applyImportData = defaultApplyImportData
 )
 
 func cmdImportArchive(args []string) error {
 	fs := commandFlagSet("import", usageImport)
-	gpgKey := fs.String("gpg-key", "", "GPG recipient used to wrap local store key if missing; default fresh imports use a Murat-managed local key")
 	replaceAccounts := fs.Bool("replace-accounts", false, "replace account store instead of merging")
 	if handled, err := parseFlags(fs, args); handled || err != nil {
 		return err
@@ -52,7 +46,7 @@ func cmdImportArchive(args []string) error {
 	if err != nil {
 		return err
 	}
-	summary, err := applyImportData(data, importOptions{GPGRecipient: *gpgKey, ReplaceAccounts: *replaceAccounts})
+	summary, err := applyImportData(data, importOptions{ReplaceAccounts: *replaceAccounts})
 	if err != nil {
 		return err
 	}
@@ -61,49 +55,7 @@ func cmdImportArchive(args []string) error {
 }
 
 func usageImport(fs *flag.FlagSet) {
-	usageFlags("import [flags] BACKUP.tar.gpg", "import accounts, known addresses, and GPG keys from a symmetric GPG-encrypted export", fs)
-}
-
-func gpgDecryptImportData(path string) (exportData, error) {
-	passphrase, err := promptBackupPassphrase()
-	if err != nil {
-		return exportData{}, err
-	}
-	defer clearBytes(passphrase)
-	passphraseFile, cleanupPassphrase, err := passphraseFD(passphrase)
-	if err != nil {
-		return exportData{}, err
-	}
-	defer cleanupPassphrase()
-
-	cmd := exec.Command("gpg", gpgSymmetricDecryptArgs(path)...)
-	cmd.ExtraFiles = []*os.File{passphraseFile}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return exportData{}, err
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return exportData{}, err
-	}
-	data, readErr := readImportTar(stdout)
-	waitErr := cmd.Wait()
-	if waitErr != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = waitErr.Error()
-		}
-		return exportData{}, fmt.Errorf("gpg decrypt failed: %s", importErrorLine(message))
-	}
-	if readErr != nil {
-		return exportData{}, readErr
-	}
-	return data, nil
-}
-
-func gpgSymmetricDecryptArgs(path string) []string {
-	return []string{"--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "3", "--quiet", "--decrypt", path}
+	usageFlags("import [flags] BACKUP", "import accounts, known addresses, and managed PGP keys from an encrypted archive", fs)
 }
 
 func importErrorLine(value string) string {
@@ -145,7 +97,7 @@ func readImportTar(r io.Reader) (exportData, error) {
 			if err := json.Unmarshal(body, &manifest); err != nil {
 				return exportData{}, fmt.Errorf("manifest.json: %w", err)
 			}
-			if manifest.Version != 1 {
+			if manifest.Version != 2 {
 				return exportData{}, fmt.Errorf("unsupported export version %d", manifest.Version)
 			}
 			manifestSeen = true
@@ -170,12 +122,10 @@ func readImportTar(r io.Reader) (exportData, error) {
 				data.KnownAddresses = []store.KnownAddress{}
 			}
 			addressesSeen = true
-		case "gpg/public.asc":
+		case "pgp/public.asc":
 			data.PublicKeys = body
-		case "gpg/secret.asc":
+		case "pgp/secret.asc":
 			data.SecretKeys = body
-		case "gpg/ownertrust.txt":
-			data.OwnerTrust = body
 		}
 	}
 	if !manifestSeen {
@@ -192,34 +142,21 @@ func readImportTar(r io.Reader) (exportData, error) {
 
 func defaultApplyImportData(data exportData, options importOptions) (importSummary, error) {
 	summary := importSummary{
-		Accounts:        len(data.Accounts),
-		KnownAddresses:  len(data.KnownAddresses),
-		PublicKeyBytes:  len(data.PublicKeys),
-		SecretKeyBytes:  len(data.SecretKeys),
-		OwnerTrustBytes: len(data.OwnerTrust),
+		Accounts:       len(data.Accounts),
+		KnownAddresses: len(data.KnownAddresses),
+		PublicKeyBytes: len(data.PublicKeys),
+		SecretKeyBytes: len(data.SecretKeys),
 	}
 	paths := store.DefaultPaths()
-	key, keyErr := store.LoadKey(paths)
+	key, keyErr := loadLocalStoreKey(paths)
 	if err := pgp.ImportKeyData(data.PublicKeys); err != nil {
 		return summary, err
 	}
 	if err := pgp.ImportKeyData(data.SecretKeys); err != nil {
 		return summary, err
 	}
-	if err := pgp.ImportOwnerTrustData(data.OwnerTrust); err != nil {
-		return summary, err
-	}
 	if keyErr != nil {
-		var err error
-		recipient := strings.TrimSpace(options.GPGRecipient)
-		if recipient != "" {
-			key, err = store.EnsureKey(paths, recipient)
-		} else {
-			key, err = store.EnsureRawKey(paths)
-		}
-		if err != nil {
-			return summary, err
-		}
+		return summary, fmt.Errorf("local store must be initialized before import: %w", keyErr)
 	}
 	accountsStore, err := store.NewAccountStore(paths, key)
 	if err != nil {

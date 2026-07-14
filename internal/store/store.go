@@ -2290,14 +2290,25 @@ func decodeBytes(data []byte, charset string) string {
 		}
 		return string(data)
 	case "iso-8859-1", "latin1", "latin-1":
+		// Some senders label UTF-8 bodies as Latin-1. Prefer valid UTF-8 here:
+		// interpreting its bytes as Latin-1 produces mojibake such as "GÃ¼ltigkeit".
+		if utf8.Valid(data) {
+			return string(data)
+		}
 		runes := make([]rune, len(data))
 		for i, b := range data {
 			runes[i] = rune(b)
 		}
 		return string(runes)
 	case "iso-8859-2", "latin2", "latin-2":
+		if utf8.Valid(data) {
+			return string(data)
+		}
 		return decodeISO88592(data)
 	case "windows-1252", "cp1252":
+		if utf8.Valid(data) {
+			return string(data)
+		}
 		return decodeWindows1252(data)
 	default:
 		return string(data)

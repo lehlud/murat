@@ -521,13 +521,7 @@ func jmapAddress(value string) map[string]string {
 
 func jmapUpload(account store.Account, uploadURL, accountID, contentType string, data []byte) (jmapUploadResponse, error) {
 	uploadURL = strings.ReplaceAll(uploadURL, "{accountId}", url.PathEscape(accountID))
-	req, err := http.NewRequest("POST", uploadURL, bytes.NewReader(data))
-	if err != nil {
-		return jmapUploadResponse{}, err
-	}
-	req.Header.Set("Content-Type", contentType)
-	setAuthHeader(req, account)
-	res, err := http.DefaultClient.Do(req)
+	res, err := doJMAPRequest(account, "POST", uploadURL, data, contentType)
 	if err != nil {
 		return jmapUploadResponse{}, err
 	}
@@ -700,23 +694,19 @@ func methodArgs(response jmapResponse, callID string) (map[string]any, error) {
 }
 
 func httpJSON(account store.Account, method, url string, body any, out any) error {
-	var reader io.Reader
+	var data []byte
+	var err error
 	if body != nil {
-		encoded, err := json.Marshal(body)
+		data, err = json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		reader = bytes.NewReader(encoded)
 	}
-	req, err := http.NewRequest(method, url, reader)
-	if err != nil {
-		return err
-	}
+	contentType := ""
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		contentType = "application/json"
 	}
-	setAuthHeader(req, account)
-	res, err := http.DefaultClient.Do(req)
+	res, err := doJMAPRequest(account, method, url, data, contentType)
 	if err != nil {
 		return err
 	}
@@ -726,6 +716,40 @@ func httpJSON(account store.Account, method, url string, body any, out any) erro
 		return fmt.Errorf("HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(data)))
 	}
 	return json.NewDecoder(res.Body).Decode(out)
+}
+
+// doJMAPRequest retries a rejected bearer credential as HTTP Basic. This lets
+// the JMAP setup prompt accept either a bearer token or an account password.
+func doJMAPRequest(account store.Account, method, target string, body []byte, contentType string) (*http.Response, error) {
+	authKinds := []string{account.AuthKind}
+	if !strings.EqualFold(account.AuthKind, "basic") {
+		authKinds = append(authKinds, "basic")
+	}
+	for i, authKind := range authKinds {
+		req, err := http.NewRequest(method, target, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		requestAccount := account
+		requestAccount.AuthKind = authKind
+		if strings.EqualFold(authKind, "basic") && strings.TrimSpace(requestAccount.Username) == "" {
+			requestAccount.Username = requestAccount.Email
+		}
+		setAuthHeader(req, requestAccount)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if i == 0 && res.StatusCode == http.StatusUnauthorized && len(authKinds) > 1 {
+			_ = res.Body.Close()
+			continue
+		}
+		return res, nil
+	}
+	panic("unreachable")
 }
 
 func setAuthHeader(req *http.Request, account store.Account) {
@@ -851,12 +875,7 @@ func jmapDownload(account store.Account, templateURL, accountID, blobID, name, c
 	target = strings.ReplaceAll(target, "{blobId}", url.PathEscape(blobID))
 	target = strings.ReplaceAll(target, "{name}", url.PathEscape(name))
 	target = strings.ReplaceAll(target, "{type}", url.PathEscape(contentType))
-	req, err := http.NewRequest("GET", target, nil)
-	if err != nil {
-		return nil, err
-	}
-	setAuthHeader(req, account)
-	res, err := http.DefaultClient.Do(req)
+	res, err := doJMAPRequest(account, "GET", target, nil, "")
 	if err != nil {
 		return nil, err
 	}

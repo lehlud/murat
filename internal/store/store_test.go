@@ -319,6 +319,17 @@ func TestDecodeWindows1252Body(t *testing.T) {
 	}
 }
 
+func TestDecodeUTF8BodyMislabelledAsLatin1(t *testing.T) {
+	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: mislabeled\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\nDie Gültigkeit läuft ab\r\n")
+	_, body, _, err := parseRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "Die Gültigkeit läuft ab" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
 func TestDecodeInvalidUTF8BodyAsWindows1252(t *testing.T) {
 	raw := []byte("From: a@example.com\r\nTo: b@example.com\r\nSubject: latin1-missing-charset\r\nContent-Type: text/plain\r\n\r\nUniversit\xe4tsorchester Pr\xe9ludes Besch\xe4ftigten\r\n")
 	_, body, _, err := parseRaw(raw)
@@ -704,7 +715,7 @@ func testPaths(dir string) Paths {
 		ConfigDir:    filepath.Join(dir, "config"),
 		ConfigFile:   filepath.Join(dir, "config", "config.toml"),
 		DataDir:      filepath.Join(dir, "data"),
-		KeyFile:      filepath.Join(dir, "data", "key.gpg"),
+		KeyFile:      filepath.Join(dir, "data", "key.ssh.json"),
 		IndexFile:    filepath.Join(dir, "data", "mail.enc.json"),
 		AccountsFile: filepath.Join(dir, "data", "accounts.enc.json"),
 		SearchFile:   filepath.Join(dir, "data", "search.enc.json"),

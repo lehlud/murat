@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -45,6 +46,34 @@ func TestJMAPFetchIDsIncludesKnownMissingAttachments(t *testing.T) {
 	want := []string{"b", "a"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("jmapFetchIDs() = %v, want %v", got, want)
+	}
+}
+
+func TestHTTPJSONRetriesRejectedBearerAsBasic(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			if got := r.Header.Get("Authorization"); got != "Bearer password" {
+				t.Fatalf("first authorization = %q", got)
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("me@example.com:password"))
+		if got := r.Header.Get("Authorization"); got != want {
+			t.Fatalf("fallback authorization = %q, want %q", got, want)
+		}
+		_, _ = w.Write([]byte(`{"apiUrl":"https://example.test/jmap"}`))
+	}))
+	defer server.Close()
+
+	var session jmapSession
+	if err := httpJSON(store.Account{Email: "me@example.com", Secret: "password"}, "GET", server.URL, nil, &session); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || session.APIURL == "" {
+		t.Fatalf("requests = %d, session = %#v", requests, session)
 	}
 }
 
@@ -127,7 +156,7 @@ func testStorePaths(dir string) store.Paths {
 		ConfigDir:    filepath.Join(dir, "config"),
 		ConfigFile:   filepath.Join(dir, "config", "config.toml"),
 		DataDir:      filepath.Join(dir, "data"),
-		KeyFile:      filepath.Join(dir, "data", "key.gpg"),
+		KeyFile:      filepath.Join(dir, "data", "key.ssh.json"),
 		IndexFile:    filepath.Join(dir, "data", "mail.enc.json"),
 		AccountsFile: filepath.Join(dir, "data", "accounts.enc.json"),
 		SearchFile:   filepath.Join(dir, "data", "search.enc.json"),

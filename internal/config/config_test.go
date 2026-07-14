@@ -43,8 +43,8 @@ attach_public_key = true
 	if cfg.Keys.Quit != "q" || cfg.Keys.ForceQuit != "Q" {
 		t.Fatalf("keys config = %#v", cfg.Keys)
 	}
-	if cfg.Crypto.GPGRecipient != "abc" {
-		t.Fatalf("crypto config = %#v", cfg.Crypto)
+	if cfg.PGP.Identity != "abc" {
+		t.Fatalf("crypto config = %#v", cfg.PGP)
 	}
 }
 

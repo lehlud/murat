@@ -14,9 +14,8 @@ It syncs mail over IMAPS or JMAP, stores messages locally under your XDG data di
 - Fullscreen terminal UI with list, preview, filters, account cycling, async sync/send, reply/reply-all/forward, spam/trash/unread, header view, attachment save/open/import.
 - Truecolor pixel-art rendering for CID-referenced PNG, JPEG, and GIF images directly in the message preview.
 - Compose flow through `$VISUAL` or `$EDITOR`.
-- PGP support through `gpg`: decrypt/verify on open, encrypt/sign/self-encrypt/attach-public-key while composing.
+- Murat-managed OpenPGP keys: decrypt/verify on open, encrypt/sign/self-encrypt/attach-public-key while composing.
 - Address index built from all seen mail identities, exposed through `murat lsp` for editor completion in compose drafts.
-- No third-party Go dependencies.
 
 ## Build
 
@@ -36,7 +35,7 @@ go build -o murat ./cmd/murat
 
 - Config: `~/.config/murat`
 - Data: `~/.local/share/murat`
-- Key: `~/.local/share/murat/key.gpg`
+- Key: `~/.local/share/murat/key.ssh.json`
 - Mail index: `~/.local/share/murat/mail.enc.json`
 - Accounts: `~/.local/share/murat/accounts.enc.json`
 - Search index: `~/.local/share/murat/search.enc.json`
@@ -53,7 +52,7 @@ murat paths
 Initialize the local key:
 
 ```sh
-murat init --gpg-key you@example.com
+murat init  # selects a local Ed25519 SSH key
 ```
 
 Add an IMAP account:
@@ -108,13 +107,13 @@ Running `murat` without arguments starts the TUI.
 Common commands:
 
 ```sh
-murat init --gpg-key KEY
+murat init --ssh-key ~/.ssh/id_ed25519
 murat account list
 murat account add-imap
 murat account add-exchange-online
 murat account add-jmap
-murat export BACKUP.tar.gpg
-murat import BACKUP.tar.gpg
+murat export BACKUP.murat
+murat import BACKUP.murat
 murat sync [--account ID_OR_EMAIL] [--limit N]
 murat compose --to you@example.com
 murat list
@@ -187,7 +186,7 @@ murat compose --to someone@example.com --pgp encrypt,sign
 
 ## PGP
 
-PGP uses the local `gpg` command.
+PGP keys are managed and encrypted by Murat. Create keys with `murat pgp create --email you@example.com`; import existing armored keys with `murat pgp import FILE`.
 
 While confirming a draft in the TUI, press `g` to open the PGP submenu. Available options are hidden unless usable:
 
@@ -196,7 +195,7 @@ While confirming a draft in the TUI, press `g` to open the PGP submenu. Availabl
 - `e`: encrypt, only if all recipient public keys are known
 - `E`: self-encrypt, only if encryption is available and a sender key exists
 
-Opening mail detects inline PGP messages/signatures and runs `gpg --decrypt` for decrypt/verify status.
+Opening mail detects inline PGP messages/signatures and decrypts or verifies them with Murat-managed keys.
 
 ## Editor Completion
 
@@ -227,8 +226,7 @@ language-servers = ["murat"]
 ## Security Notes
 
 - Inline image rendering only decodes image data already present in the local MIME message. It never fetches remote or data-URL image sources, and applies count, byte-size, dimension, and decoded-pixel limits.
-- Local store encryption depends on local key-file protection and local machine security; `murat init --gpg-key KEY` and `murat import --gpg-key KEY` wrap that local key with GPG.
+- `murat init` wraps Murat's local store key with a selected Ed25519 SSH key. It uses `ssh-agent` when available and otherwise prompts for that SSH key's passphrase.
 - Account secrets are stored inside the encrypted account store.
-- `murat export` writes account secrets and GPG secret keys into one archive encrypted by the backup passphrase you enter; `murat import` prompts for the same passphrase.
-- `murat import` imports that archive into GPG and the Murat store; fresh imports create a Murat-managed local store key by default, while `--gpg-key KEY` opts into GPG-wrapping that local key. If the default GPG keyring rejects writes, Murat falls back to a private GPG home under its data directory.
-- PGP operations are delegated to `gpg`; key trust and recipient availability follow your local GnuPG keyring.
+- `murat export` writes account secrets and Murat-managed PGP secret keys into one native encrypted archive; `murat import` accepts that same archive format only and prompts for its backup passphrase.
+- PGP keys are managed by Murat and stored encrypted with the local store key; use `murat pgp` to list, create, import, or export them.

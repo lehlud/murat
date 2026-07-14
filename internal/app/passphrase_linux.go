@@ -46,6 +46,10 @@ func readNewBackupPassphrase() ([]byte, error) {
 	return first, nil
 }
 
+func readSSHKeyPassphrase(path string) ([]byte, error) {
+	return readBackupPassphrasePrompt("SSH key passphrase for " + path + ": ")
+}
+
 func readBackupPassphrasePrompt(prompt string) ([]byte, error) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {

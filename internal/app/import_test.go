@@ -2,7 +2,6 @@ package app
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +14,6 @@ func TestReadImportTarReadsExportArchive(t *testing.T) {
 		KnownAddresses: []store.KnownAddress{{Name: "Alice", Email: "alice@example.com", Count: 2}},
 		PublicKeys:     []byte("public"),
 		SecretKeys:     []byte("secret"),
-		OwnerTrust:     []byte("trust"),
 	}
 	var buf bytes.Buffer
 	if err := writeExportTarAt(&buf, data, time.Unix(0, 0).UTC()); err != nil {
@@ -31,17 +29,8 @@ func TestReadImportTarReadsExportArchive(t *testing.T) {
 	if len(got.KnownAddresses) != 1 || got.KnownAddresses[0].Email != "alice@example.com" {
 		t.Fatalf("known addresses = %#v", got.KnownAddresses)
 	}
-	if string(got.PublicKeys) != "public" || string(got.SecretKeys) != "secret" || string(got.OwnerTrust) != "trust" {
-		t.Fatalf("gpg data = %q %q %q", got.PublicKeys, got.SecretKeys, got.OwnerTrust)
-	}
-}
-
-func TestGPGSymmetricDecryptArgsUseLoopbackPassphraseFD(t *testing.T) {
-	args := strings.Join(gpgSymmetricDecryptArgs("backup.murat"), " ")
-	for _, want := range []string{"--pinentry-mode loopback", "--passphrase-fd 3", "--decrypt backup.murat"} {
-		if !strings.Contains(args, want) {
-			t.Fatalf("args %q missing %q", args, want)
-		}
+	if string(got.PublicKeys) != "public" || string(got.SecretKeys) != "secret" {
+		t.Fatalf("pgp data = %q %q", got.PublicKeys, got.SecretKeys)
 	}
 }
 
@@ -62,19 +51,16 @@ func TestCmdImportPassesOptions(t *testing.T) {
 		if len(data.Accounts) != 1 || data.Accounts[0].ID != "acct" {
 			t.Fatalf("data = %#v", data)
 		}
-		if options.GPGRecipient != "me@example.com" {
-			t.Fatalf("gpg recipient = %q", options.GPGRecipient)
-		}
 		if !options.ReplaceAccounts {
 			t.Fatal("replace accounts = false")
 		}
 		return importSummary{Accounts: 1}, nil
 	}
 
-	if err := cmdImportArchive([]string{"--gpg-key", "me@example.com", "--replace-accounts", "backup.tar.gpg"}); err != nil {
+	if err := cmdImportArchive([]string{"--replace-accounts", "backup.murat"}); err != nil {
 		t.Fatal(err)
 	}
-	if readPath != "backup.tar.gpg" {
+	if readPath != "backup.murat" {
 		t.Fatalf("read path = %q", readPath)
 	}
 }

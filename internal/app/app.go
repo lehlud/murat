@@ -24,11 +24,20 @@ import (
 	"lehnert.dev/murat/internal/store"
 	"lehnert.dev/murat/internal/ui"
 	"lehnert.dev/murat/internal/userdirs"
+
+	"golang.org/x/term"
 )
 
 var commit = "dev"
 
 const defaultSyncLimit = 350
+
+var (
+	promptSSHKeyPassphrase = readSSHKeyPassphrase
+	loadStoreKey           = func(paths store.Paths) ([]byte, error) {
+		return store.LoadSSHKey(paths, promptSSHKeyPassphrase)
+	}
+)
 
 func Main(args []string) error {
 	pgp.ActivateManagedHomeIfPresent()
@@ -40,6 +49,8 @@ func Main(args []string) error {
 		return cmdInit(args[1:])
 	case "account":
 		return cmdAccount(args[1:])
+	case "pgp":
+		return cmdPGP(args[1:])
 	case "export":
 		return cmdExport(args[1:])
 	case "import":
@@ -101,8 +112,9 @@ func usage() {
 	fmt.Println(helpSection("Commands:"))
 	usageCommand("init", "initialize encrypted local store")
 	usageCommand("account", "manage mail accounts")
-	usageCommand("export", "export encrypted account and GPG backup")
-	usageCommand("import", "import encrypted account and GPG backup")
+	usageCommand("pgp", "manage OpenPGP keys")
+	usageCommand("export", "export encrypted account backup")
+	usageCommand("import", "import encrypted account backup")
 	usageCommand("sync", "fetch new mail")
 	usageCommand("compose", "compose and send mail")
 	usageCommand("tui", "open fullscreen UI")
@@ -283,23 +295,81 @@ func helpColorEnabled() bool {
 
 func cmdInit(args []string) error {
 	fs := commandFlagSet("init", usageInit)
-	gpg := fs.String("gpg-key", "", "GPG recipient used to wrap local key")
+	sshKey := fs.String("ssh-key", "", "path to an Ed25519 SSH private key")
 	if handled, err := parseFlags(fs, args); handled || err != nil {
 		return err
 	}
-	paths := store.DefaultPaths()
-	if strings.TrimSpace(*gpg) == "" {
-		cfg, err := config.Load(paths.ConfigFile)
-		if err != nil {
-			return err
-		}
-		*gpg = cfg.Crypto.GPGRecipient
+	path, err := selectSSHKeyPath(*sshKey)
+	if err != nil {
+		return err
 	}
-	if _, err := store.EnsureKey(paths, *gpg); err != nil {
+	if _, err := store.CreateSSHKey(store.DefaultPaths(), path, promptSSHKeyPassphrase); err != nil {
 		return err
 	}
 	fmt.Println("initialized")
 	return nil
+}
+
+func selectSSHKeyPath(value string) (string, error) {
+	if path := strings.TrimSpace(value); path != "" {
+		return path, nil
+	}
+	candidates, err := store.FindSSHKeyCandidates()
+	if err != nil {
+		return "", err
+	}
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no local Ed25519 SSH keys found; pass --ssh-key PATH")
+	}
+	if len(candidates) == 1 {
+		return candidates[0].Path, nil
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", fmt.Errorf("multiple SSH keys found; pass --ssh-key PATH")
+	}
+	state, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return "", err
+	}
+	defer term.Restore(int(os.Stdin.Fd()), state)
+	selected := 0
+	for {
+		fmt.Print("\x1b[2J\x1b[HSelect SSH key (Up/Down, Enter, Esc):\r\n\r\n")
+		for i, candidate := range candidates {
+			prefix := "  "
+			if i == selected {
+				prefix = "> "
+			}
+			label := candidate.Path + " (" + candidate.Fingerprint + ")"
+			if candidate.Comment != "" {
+				label += " " + candidate.Comment
+			}
+			fmt.Print(prefix + label + "\r\n")
+		}
+		key := make([]byte, 3)
+		n, err := os.Stdin.Read(key)
+		if err != nil {
+			return "", err
+		}
+		if n == 1 {
+			if key[0] == '\r' || key[0] == '\n' {
+				fmt.Print("\x1b[2J\x1b[H")
+				return candidates[selected].Path, nil
+			}
+			if key[0] == 3 || key[0] == 27 {
+				fmt.Print("\x1b[2J\x1b[H")
+				return "", fmt.Errorf("SSH key selection cancelled")
+			}
+		}
+		if n == 3 && key[0] == 27 && key[1] == '[' {
+			if key[2] == 'A' && selected > 0 {
+				selected--
+			}
+			if key[2] == 'B' && selected < len(candidates)-1 {
+				selected++
+			}
+		}
+	}
 }
 
 func usageInit(fs *flag.FlagSet) {
@@ -757,7 +827,7 @@ func cmdTUI(args []string) error {
 	}
 	return ui.Run(s, accounts, ui.Options{
 		PGPDefaults: cfg.PGPOptions(),
-		PGPIdentity: cfg.Crypto.GPGRecipient,
+		PGPIdentity: cfg.PGP.Identity,
 		Theme:       ui.ThemeFromConfig(cfg.Theme),
 		Keys:        ui.KeysFromConfig(cfg.Keys),
 		Editor:      cfg.UI.Editor,
@@ -831,7 +901,7 @@ func cmdCompose(args []string) error {
 	if err != nil {
 		return err
 	}
-	draft, status, err := pgp.ApplyDraft(pgpIdentity(senderEmail(draft.From), cfg.Crypto.GPGRecipient), draft)
+	draft, status, err := pgp.ApplyDraft(pgpIdentity(senderEmail(draft.From), cfg.PGP.Identity), draft)
 	if err != nil {
 		return err
 	}
@@ -966,7 +1036,7 @@ func usageSync(fs *flag.FlagSet) {
 
 func openStore() (*store.Store, error) {
 	paths := store.DefaultPaths()
-	key, err := store.LoadKey(paths)
+	key, err := loadLocalStoreKey(paths)
 	if err != nil {
 		return nil, fmt.Errorf("not initialized: %w", err)
 	}
@@ -975,11 +1045,19 @@ func openStore() (*store.Store, error) {
 
 func openAccounts() (*store.AccountStore, error) {
 	paths := store.DefaultPaths()
-	key, err := store.LoadKey(paths)
+	key, err := loadLocalStoreKey(paths)
 	if err != nil {
 		return nil, fmt.Errorf("not initialized: %w", err)
 	}
 	return store.NewAccountStore(paths, key)
+}
+
+func loadLocalStoreKey(paths store.Paths) ([]byte, error) {
+	key, err := loadStoreKey(paths)
+	if err == nil {
+		pgp.Configure(paths, key)
+	}
+	return key, err
 }
 
 func saveAccount(accounts *store.AccountStore, account store.Account) error {
@@ -1195,4 +1273,58 @@ func trim(value string, width int) string {
 		return value[:width]
 	}
 	return value[:width-3] + "..."
+}
+
+func cmdPGP(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: murat pgp list|create|import|export")
+	}
+	if _, err := openStore(); err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list":
+		items, err := pgp.List()
+		if err != nil {
+			return err
+		}
+		for _, item := range items {
+			fmt.Println(item)
+		}
+		return nil
+	case "create":
+		fs := commandFlagSet("pgp create", func(fs *flag.FlagSet) {
+			usageFlags("pgp create --email EMAIL [--name NAME]", "create a managed OpenPGP key", fs)
+		})
+		email := fs.String("email", "", "email identity")
+		name := fs.String("name", "", "display name")
+		if handled, err := parseFlags(fs, args[1:]); handled || err != nil {
+			return err
+		}
+		if err := pgp.Create(*email, *name); err != nil {
+			return err
+		}
+		fmt.Println("PGP key created")
+		return nil
+	case "import":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: murat pgp import FILE")
+		}
+		data, err := os.ReadFile(args[1])
+		if err != nil {
+			return err
+		}
+		return pgp.ImportKeyData(data)
+	case "export":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: murat pgp export EMAIL OUTPUT")
+		}
+		data, err := pgp.ExportPublicKey(args[1])
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(args[2], data, 0o600)
+	default:
+		return fmt.Errorf("unknown pgp command %q", args[0])
+	}
 }

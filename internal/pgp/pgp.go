@@ -2,484 +2,221 @@ package pgp
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/mail"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"lehnert.dev/murat/internal/crypto"
 	"lehnert.dev/murat/internal/protocol"
+	"lehnert.dev/murat/internal/store"
+
+	"golang.org/x/crypto/openpgp"
+	"golang.org/x/crypto/openpgp/armor"
+	"golang.org/x/crypto/openpgp/clearsign"
+	_ "golang.org/x/crypto/ripemd160" // register legacy OpenPGP recipient preference hash
 )
 
-type Availability struct {
-	Sign            bool
-	Encrypt         bool
-	SelfEncrypt     bool
-	AttachPublicKey bool
-}
-
-var ErrPassphraseRequired = errors.New("pgp: passphrase required")
-
+type Availability struct{ Sign, Encrypt, SelfEncrypt, AttachPublicKey bool }
 type ApplyDraftOptions struct {
 	LoopbackPinentry bool
 	Passphrase       []byte
 }
 
-func IsPassphraseRequired(err error) bool {
-	return errors.Is(err, ErrPassphraseRequired)
+var ErrPassphraseRequired = errors.New("pgp: passphrase required")
+
+var ringState struct {
+	sync.Mutex
+	paths store.Paths
+	key   []byte
 }
 
-func ProcessText(text string) (string, string, bool) {
-	return ProcessTextWithKeys(text, nil)
+func ActivateManagedHomeIfPresent() {}
+
+func Configure(paths store.Paths, key []byte) {
+	ringState.Lock()
+	defer ringState.Unlock()
+	ringState.paths = paths
+	ringState.key = append(ringState.key[:0], key...)
 }
 
-func ProcessTextWithKeys(text string, publicKeys [][]byte) (string, string, bool) {
-	encrypted := strings.Contains(text, "-----BEGIN PGP MESSAGE-----")
-	signed := strings.Contains(text, "-----BEGIN PGP SIGNED MESSAGE-----")
-	if !encrypted && !signed {
+func Create(email, name string) error {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return fmt.Errorf("pgp: email required")
+	}
+	ring, err := loadRing()
+	if err != nil {
+		return err
+	}
+	if entityFor(ring, email, false) != nil {
+		return fmt.Errorf("pgp: key already exists for %s", email)
+	}
+	entity, err := openpgp.NewEntity(name, "", email, nil)
+	if err != nil {
+		return fmt.Errorf("pgp: create key: %w", err)
+	}
+	ring = append(ring, entity)
+	return saveRing(ring)
+}
+
+func List() ([]string, error) {
+	ring, err := loadRing()
+	if err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, entity := range ring {
+		for identity := range entity.Identities {
+			out = append(out, identity)
+		}
+	}
+	return out, nil
+}
+
+func ImportKeyData(data []byte) error {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	incoming, err := readKeyRing(data)
+	if err != nil {
+		return fmt.Errorf("pgp: import keys: %w", err)
+	}
+	ring, err := loadRing()
+	if err != nil {
+		return err
+	}
+	for _, entity := range incoming {
+		if entity.PrimaryKey == nil {
+			continue
+		}
+		replaced := false
+		for i, current := range ring {
+			if current.PrimaryKey != nil && current.PrimaryKey.KeyId == entity.PrimaryKey.KeyId {
+				ring[i] = entity
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			ring = append(ring, entity)
+		}
+	}
+	return saveRing(ring)
+}
+
+func ExportAllPublicKeys() ([]byte, error) {
+	ring, err := loadRing()
+	if err != nil {
+		return nil, err
+	}
+	return armorPublic(ring)
+}
+
+func ExportAllSecretKeys() ([]byte, error) {
+	ring, err := loadRing()
+	if err != nil {
+		return nil, err
+	}
+	return armorPrivate(ring)
+}
+
+func ExportPublicKey(identity string) ([]byte, error) {
+	ring, err := loadRing()
+	if err != nil {
+		return nil, err
+	}
+	entity := entityFor(ring, identity, false)
+	if entity == nil {
+		return nil, fmt.Errorf("pgp: public key not found for %s", identity)
+	}
+	return armorPublic(openpgp.EntityList{entity})
+}
+
+func ProcessTextWithKeys(text string, attached [][]byte) (string, string, bool) {
+	if !strings.Contains(text, "-----BEGIN PGP ") {
 		return text, "", false
 	}
-	if signed && !encrypted {
-		return processClearSignedText(text, publicKeys)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gpg", "--batch", "--yes", "--decrypt")
-	cmd.Stdin = strings.NewReader(text)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
-		return text, "pgp: decrypt timed out", false
-	}
+	ring, err := loadRing()
 	if err != nil {
-		return text, "pgp: decrypt failed: " + oneLine(stderr.String()), false
+		return text, "pgp: keyring unavailable", false
 	}
-	return strings.TrimSpace(stdout.String()), pgpStatus(stderr.String(), encrypted), true
-}
-
-func processClearSignedText(text string, publicKeys [][]byte) (string, string, bool) {
-	clearText, ok := clearSignedText(text)
-	if !ok {
-		clearText = text
-	}
-	result := runGPGVerify(text, "")
-	identity := signatureIdentity(text, result)
-	if result.timedOut {
-		return clearText, "pgp: verify timed out", true
-	}
-	if result.err != nil {
-		status := pgpFailureStatus("verify", result.output(), result.err)
-		if isMissingPublicKeyStatus(status, result.output()) {
-			if localStatus, ok := verifyWithLocalKey(text, identity); ok {
-				return clearText, localStatus, true
-			}
-			if attachedStatus, ok := verifyWithAttachedPublicKeys(text, publicKeys, identity); ok {
-				return clearText, attachedStatus, true
-			}
-		}
-		return clearText, status, true
-	}
-	return clearText, pgpStatus(result.output(), false), true
-}
-
-func clearSignedText(text string) (string, bool) {
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
-	lines := strings.Split(text, "\n")
-	start := -1
-	for i, line := range lines {
-		if strings.TrimSpace(line) == "-----BEGIN PGP SIGNED MESSAGE-----" {
-			start = i + 1
-			break
+	for _, data := range attached {
+		if keys, err := readKeyRing(data); err == nil {
+			ring = append(ring, keys...)
 		}
 	}
-	if start < 0 {
-		return "", false
-	}
-	for start < len(lines) && strings.TrimSpace(lines[start]) != "" {
-		start++
-	}
-	if start >= len(lines) {
-		return "", false
-	}
-	start++
-	out := []string{}
-	for ; start < len(lines); start++ {
-		line := lines[start]
-		if strings.TrimSpace(line) == "-----BEGIN PGP SIGNATURE-----" {
-			return strings.TrimSpace(strings.Join(out, "\n")), true
+	if strings.Contains(text, "-----BEGIN PGP SIGNED MESSAGE-----") {
+		block, rest := clearsign.Decode([]byte(text))
+		if block == nil || len(bytes.TrimSpace(rest)) != 0 {
+			return text, "pgp: verify failed", true
 		}
-		if strings.HasPrefix(line, "- ") {
-			line = strings.TrimPrefix(line, "- ")
-		}
-		out = append(out, line)
-	}
-	return "", false
-}
-
-type gpgVerifyResult struct {
-	status   string
-	stderr   string
-	err      error
-	timedOut bool
-}
-
-func (r gpgVerifyResult) output() string {
-	return strings.TrimSpace(r.status + "\n" + r.stderr)
-}
-
-type signatureID struct {
-	fingerprint string
-	keyID       string
-}
-
-func runGPGVerify(text, homedir string) gpgVerifyResult {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	args := []string{"--batch", "--yes", "--status-fd", "1"}
-	if homedir != "" {
-		args = append(args, "--homedir", homedir)
-	}
-	args = append(args, "--verify")
-	cmd := exec.CommandContext(ctx, "gpg", args...)
-	cmd.Stdin = strings.NewReader(text)
-	var status bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &status
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	return gpgVerifyResult{status: status.String(), stderr: stderr.String(), err: err, timedOut: ctx.Err() == context.DeadlineExceeded}
-}
-
-func verifyWithLocalKey(text string, identity signatureID) (string, bool) {
-	lookup := identity.lookupValues()
-	if len(lookup) == 0 {
-		return "", false
-	}
-	for _, value := range lookup {
-		key, err := ExportPublicKey(value)
+		_, err := openpgp.CheckArmoredDetachedSignature(ring, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body)
 		if err != nil {
-			continue
+			return string(block.Bytes), "pgp: signature invalid", true
 		}
-		status, ok := verifyWithPublicKeyData(text, [][]byte{key}, "local key", localTrustStatus(value))
-		if ok {
-			return status, true
-		}
+		return string(block.Bytes), "pgp: signature valid", true
 	}
-	return "", false
-}
-
-func verifyWithAttachedPublicKeys(text string, publicKeys [][]byte, identity signatureID) (string, bool) {
-	if len(publicKeys) == 0 {
-		return "", false
-	}
-	return verifyWithPublicKeyData(text, matchingPublicKeys(publicKeys, identity), "attached public key", "untrusted")
-}
-
-func verifyWithPublicKeyData(text string, publicKeys [][]byte, source, trust string) (string, bool) {
-	if len(publicKeys) == 0 {
-		return "", false
-	}
-	dir, err := os.MkdirTemp("", "murat-pgp-verify-*")
+	block, err := armor.Decode(strings.NewReader(text))
 	if err != nil {
-		return "", false
+		return text, "pgp: decrypt failed", false
 	}
-	defer os.RemoveAll(dir)
-	imported := 0
-	for _, key := range publicKeys {
-		if importPublicKey(dir, key) == nil {
-			imported++
+	message, err := openpgp.ReadMessage(block.Body, ring, nil, nil)
+	if err != nil {
+		return text, "pgp: decrypt failed: " + oneLine(err.Error()), false
+	}
+	plain, err := io.ReadAll(message.UnverifiedBody)
+	if err != nil {
+		return text, "pgp: decrypt failed: " + oneLine(err.Error()), false
+	}
+	status := "pgp: decrypted"
+	if message.IsSigned {
+		if message.SignatureError != nil {
+			status += "; signature invalid"
+		} else {
+			status += "; signature valid"
 		}
 	}
-	if imported == 0 {
-		return "", false
-	}
-	result := runGPGVerify(text, dir)
-	suffix := " with " + source
-	if trust != "" {
-		suffix += " (" + trust + ")"
-	}
-	if result.timedOut {
-		return "pgp: verify timed out" + suffix, true
-	}
-	status := pgpStatus(result.output(), false)
-	if result.err == nil {
-		if strings.Contains(strings.ToLower(status), "signature valid") {
-			return "pgp: signature valid" + suffix, true
-		}
-		return "pgp: signature verified" + suffix, true
-	}
-	if strings.Contains(strings.ToLower(status), "signature bad") {
-		return "pgp: signature BAD" + suffix, true
-	}
-	if isMissingPublicKeyStatus(status, result.output()) {
-		return "", false
-	}
-	if status != "" {
-		return status + suffix, true
-	}
-	return "", false
+	return strings.TrimSpace(string(plain)), status, true
 }
 
-func matchingPublicKeys(publicKeys [][]byte, identity signatureID) [][]byte {
-	if identity.empty() {
-		return publicKeys
-	}
-	out := [][]byte{}
-	for _, key := range publicKeys {
-		ids := publicKeyIdentities(key)
-		if ids.matches(identity) {
-			out = append(out, key)
-		}
-	}
-	return out
-}
+func ProcessText(text string) (string, string, bool) { return ProcessTextWithKeys(text, nil) }
 
-func importPublicKey(homedir string, key []byte) error {
-	if len(bytes.TrimSpace(key)) == 0 {
-		return fmt.Errorf("empty key")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gpg", "--batch", "--yes", "--homedir", homedir, "--import")
-	cmd.Stdin = bytes.NewReader(key)
-	return cmd.Run()
-}
-
-func IsPublicKeyAttachment(filename, contentType string, data []byte) bool {
-	if bytes.Contains(data, []byte("-----BEGIN PGP PUBLIC KEY BLOCK-----")) {
-		return true
-	}
-	contentType = strings.ToLower(strings.TrimSpace(contentType))
-	if strings.Contains(contentType, "pgp-keys") {
-		return true
-	}
-	name := strings.ToLower(filepath.Base(filename))
-	return strings.HasSuffix(name, ".asc") || strings.HasSuffix(name, ".pgp") || strings.HasSuffix(name, ".gpg")
-}
-
-func signatureIdentity(text string, result gpgVerifyResult) signatureID {
-	id := signatureIDFromStatus(result.status)
-	packetID := signatureIDFromPackets(text)
-	if id.fingerprint == "" {
-		id.fingerprint = packetID.fingerprint
-	}
-	if id.keyID == "" {
-		id.keyID = firstNonEmpty(packetID.keyID, keyIDFromFingerprint(id.fingerprint))
-	}
-	return id
-}
-
-func signatureIDFromStatus(status string) signatureID {
-	id := signatureID{}
-	for _, line := range strings.Split(status, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 3 || fields[0] != "[GNUPG:]" {
-			continue
-		}
-		switch fields[1] {
-		case "VALIDSIG":
-			if len(fields) > 2 {
-				id.fingerprint = normalizeKeyID(fields[2])
-			}
-		case "NO_PUBKEY", "ERRSIG", "BADSIG", "GOODSIG":
-			if len(fields) > 2 && id.keyID == "" {
-				id.keyID = normalizeKeyID(fields[2])
-			}
-		}
-	}
-	if id.keyID == "" {
-		id.keyID = keyIDFromFingerprint(id.fingerprint)
-	}
-	return id
-}
-
-func signatureIDFromPackets(text string) signatureID {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gpg", "--batch", "--list-packets")
-	cmd.Stdin = strings.NewReader(text)
-	out, _ := cmd.CombinedOutput()
-	data := string(out)
-	fprRE := regexp.MustCompile(`(?i)issuer fpr[^A-F0-9]*([A-F0-9]{40,64})`)
-	keyRE := regexp.MustCompile(`(?i)keyid[ :]+([A-F0-9]{16})`)
-	id := signatureID{}
-	if match := fprRE.FindStringSubmatch(data); len(match) > 1 {
-		id.fingerprint = normalizeKeyID(match[1])
-	}
-	if match := keyRE.FindStringSubmatch(data); len(match) > 1 {
-		id.keyID = normalizeKeyID(match[1])
-	}
-	if id.keyID == "" {
-		id.keyID = keyIDFromFingerprint(id.fingerprint)
-	}
-	return id
-}
-
-func publicKeyIdentities(key []byte) signatureID {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gpg", "--batch", "--with-colons", "--import-options", "show-only", "--import")
-	cmd.Stdin = bytes.NewReader(key)
-	out, err := cmd.Output()
-	if err != nil || ctx.Err() != nil {
-		return signatureID{}
-	}
-	id := signatureID{}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Split(line, ":")
-		if len(fields) < 10 {
-			continue
-		}
-		switch fields[0] {
-		case "pub", "sub":
-			if id.keyID == "" {
-				id.keyID = normalizeKeyID(fields[4])
-			}
-		case "fpr":
-			if id.fingerprint == "" {
-				id.fingerprint = normalizeKeyID(fields[9])
-			}
-		}
-	}
-	if id.keyID == "" {
-		id.keyID = keyIDFromFingerprint(id.fingerprint)
-	}
-	return id
-}
-
-func localTrustStatus(identity string) string {
-	if strings.TrimSpace(identity) == "" {
-		return "local trust unknown"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gpg", "--batch", "--with-colons", "--list-keys", identity)
-	out, err := cmd.Output()
-	if err != nil || ctx.Err() != nil {
-		return "local trust unknown"
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Split(line, ":")
-		if len(fields) < 2 || fields[0] != "pub" {
-			continue
-		}
-		return trustName(fields[1])
-	}
-	return "local trust unknown"
-}
-
-func trustName(validity string) string {
-	switch validity {
-	case "u":
-		return "ultimate trust"
-	case "f":
-		return "full trust"
-	case "m":
-		return "marginal trust"
-	case "n":
-		return "not trusted"
-	case "r":
-		return "revoked"
-	case "e":
-		return "expired"
-	default:
-		return "local trust unknown"
-	}
-}
-
-func (id signatureID) lookupValues() []string {
-	values := []string{}
-	if id.fingerprint != "" {
-		values = append(values, id.fingerprint)
-	}
-	if id.keyID != "" && id.keyID != id.fingerprint {
-		values = append(values, id.keyID)
-	}
-	return values
-}
-
-func (id signatureID) empty() bool {
-	return id.fingerprint == "" && id.keyID == ""
-}
-
-func (id signatureID) matches(other signatureID) bool {
-	if id.empty() || other.empty() {
-		return false
-	}
-	for _, left := range id.lookupValues() {
-		for _, right := range other.lookupValues() {
-			if sameKeyID(left, right) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func sameKeyID(left, right string) bool {
-	left = normalizeKeyID(left)
-	right = normalizeKeyID(right)
-	return left != "" && right != "" && (left == right || strings.HasSuffix(left, right) || strings.HasSuffix(right, left))
-}
-
-func normalizeKeyID(value string) string {
-	value = strings.ToUpper(strings.TrimSpace(value))
-	clean := strings.Builder{}
-	for _, r := range value {
-		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'F') {
-			clean.WriteRune(r)
-		}
-	}
-	return clean.String()
-}
-
-func keyIDFromFingerprint(fpr string) string {
-	fpr = normalizeKeyID(fpr)
-	if len(fpr) <= 16 {
-		return fpr
-	}
-	return fpr[len(fpr)-16:]
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
+func IsPublicKeyAttachment(name, contentType string, data []byte) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	contentType = strings.ToLower(contentType)
+	return strings.Contains(contentType, "pgp-keys") || strings.HasSuffix(name, ".asc") || strings.HasSuffix(name, ".pgp") || bytes.Contains(data, []byte("-----BEGIN PGP PUBLIC KEY BLOCK-----"))
 }
 
 func ApplyDraft(from string, draft protocol.Draft) (protocol.Draft, string, error) {
 	return ApplyDraftWithOptions(from, draft, ApplyDraftOptions{})
 }
 
-func ApplyDraftWithOptions(from string, draft protocol.Draft, options ApplyDraftOptions) (protocol.Draft, string, error) {
-	pgpOptions := ParseOptions(draft.PGP)
-	encrypt := pgpOptions["encrypt"] || pgpOptions["encrypted"]
-	sign := pgpOptions["sign"] || pgpOptions["signed"]
-	selfEncrypt := pgpOptions["self-encrypt"] || pgpOptions["selfencrypt"] || pgpOptions["self"]
-	attachPublicKey := pgpOptions["attach-pubkey"] || pgpOptions["attach-public-key"] || pgpOptions["pubkey"]
-	if selfEncrypt && !encrypt {
+func ApplyDraftWithOptions(from string, draft protocol.Draft, _ ApplyDraftOptions) (protocol.Draft, string, error) {
+	options := ParseOptions(draft.PGP)
+	encrypt := options["encrypt"] || options["encrypted"]
+	sign := options["sign"] || options["signed"]
+	self := options["self-encrypt"] || options["selfencrypt"] || options["self"]
+	attach := options["attach-pubkey"] || options["attach-public-key"] || options["pubkey"]
+	if self && !encrypt {
 		return draft, "", fmt.Errorf("pgp: self-encrypt needs encrypt")
 	}
-	needsSecret := sign || selfEncrypt || attachPublicKey
-	if needsSecret && !HasSecretKey(from) {
+	ring, err := loadRing()
+	if err != nil {
+		return draft, "", err
+	}
+	signer := entityFor(ring, from, true)
+	if (sign || self || attach) && signer == nil {
 		return draft, "", fmt.Errorf("pgp: no secret key for %s", from)
 	}
 	status := []string{}
-	if attachPublicKey {
-		key, err := ExportPublicKey(from)
+	if attach {
+		key, err := armorPublic(openpgp.EntityList{signer})
 		if err != nil {
 			return draft, "", err
 		}
@@ -488,427 +225,315 @@ func ApplyDraftWithOptions(from string, draft protocol.Draft, options ApplyDraft
 	}
 	if !encrypt && !sign {
 		draft.PGP = ""
-		if len(status) > 0 {
-			return draft, "pgp: " + strings.Join(status, "; "), nil
+		if len(status) == 0 {
+			return draft, "", nil
 		}
-		return draft, "", nil
+		return draft, "pgp: " + strings.Join(status, "; "), nil
 	}
-	args := []string{"--batch", "--yes", "--armor"}
-	if sign {
-		args = append(args, "--local-user", from)
-	}
+	recipients := []*openpgp.Entity{}
 	if encrypt {
-		recipients := draftRecipients(draft)
+		for _, address := range draftRecipients(draft) {
+			entity := entityFor(ring, address, false)
+			if entity == nil {
+				return draft, "", fmt.Errorf("pgp: missing public key for %s", address)
+			}
+			recipients = append(recipients, entity)
+		}
 		if len(recipients) == 0 {
 			return draft, "", fmt.Errorf("pgp: encrypt needs recipient")
 		}
-		missing := MissingPublicKeys(recipients)
-		if len(missing) > 0 {
-			return draft, "", fmt.Errorf("pgp: missing public key for %s", strings.Join(missing, ", "))
-		}
-		if selfEncrypt {
-			recipients = append(recipients, from)
+		if self {
+			recipients = append(recipients, signer)
 			status = append(status, "self encrypted")
-		}
-		args = append(args, "--encrypt")
-		for _, recipient := range recipients {
-			args = append(args, "--recipient", recipient)
 		}
 	}
 	if len(draft.Attachments) > 0 {
 		entity := canonicalCRLF(protocol.MIMEEntity(draft))
 		if encrypt {
-			if sign {
-				args = append(args, "--digest-algo", "SHA256", "--sign")
-			}
-			out, err := runGPGWithOptions(entity, args, options)
+			out, err := armoredEncrypt(entity, recipients, signerIf(sign, signer))
 			if err != nil {
 				return draft, "", err
 			}
 			draft.RawMIME = encryptedMIMEEntity(out)
 		} else {
-			out, err := runGPGWithOptions(entity, append(args, "--digest-algo", "SHA256", "--detach-sign"), options)
-			if err != nil {
+			var signature bytes.Buffer
+			if err := openpgp.ArmoredDetachSign(&signature, signer, strings.NewReader(entity), nil); err != nil {
 				return draft, "", err
 			}
-			draft.RawMIME = signedMIMEEntity(entity, out)
+			draft.RawMIME = signedMIMEEntity(entity, signature.String())
 		}
 		draft.Body = ""
 		draft.Attachments = nil
 		draft.PGP = ""
-		switch {
-		case encrypt && sign:
-			status = append([]string{"encrypted", "signed"}, status...)
-		case encrypt:
+		if encrypt {
 			status = append([]string{"encrypted"}, status...)
-		default:
-			status = append([]string{"signed"}, status...)
+		}
+		if sign {
+			status = append(status, "signed")
 		}
 		return draft, "pgp: " + strings.Join(status, "; "), nil
 	}
-	if sign && encrypt {
-		args = append(args, "--sign")
-	} else if sign {
-		args = append(args, "--clearsign")
+	if encrypt {
+		out, err := armoredEncrypt(draft.Body, recipients, signerIf(sign, signer))
+		if err != nil {
+			return draft, "", err
+		}
+		draft.Body = out
+	} else {
+		var out bytes.Buffer
+		writer, err := clearsign.Encode(&out, signer.PrivateKey, nil)
+		if err != nil {
+			return draft, "", err
+		}
+		if _, err := writer.Write([]byte(draft.Body)); err != nil {
+			return draft, "", err
+		}
+		if err := writer.Close(); err != nil {
+			return draft, "", err
+		}
+		draft.Body = out.String()
 	}
-	out, err := runGPGWithOptions(draft.Body, args, options)
-	if err != nil {
-		return draft, "", err
-	}
-	draft.Body = out
 	draft.PGP = ""
-	switch {
-	case encrypt && sign:
-		status = append([]string{"encrypted", "signed"}, status...)
-	case encrypt:
+	if encrypt {
 		status = append([]string{"encrypted"}, status...)
-	default:
-		status = append([]string{"signed"}, status...)
+	}
+	if sign {
+		status = append(status, "signed")
 	}
 	return draft, "pgp: " + strings.Join(status, "; "), nil
-}
-
-func runGPG(input string, args []string) (string, error) {
-	return runGPGWithOptions(input, args, ApplyDraftOptions{})
-}
-
-func runGPGWithOptions(input string, args []string, options ApplyDraftOptions) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmdArgs := append([]string(nil), args...)
-	var passphraseFile *os.File
-	cleanupPassphrase := func() {}
-	if options.LoopbackPinentry {
-		cmdArgs = gpgLoopbackArgs(cmdArgs)
-		var err error
-		passphraseFile, cleanupPassphrase, err = gpgPassphraseFD(options.Passphrase)
-		if err != nil {
-			return "", err
-		}
-		defer cleanupPassphrase()
-	}
-	cmd := exec.CommandContext(ctx, "gpg", cmdArgs...)
-	cmd.Stdin = strings.NewReader(input)
-	if passphraseFile != nil {
-		cmd.ExtraFiles = []*os.File{passphraseFile}
-	}
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("pgp: send timed out")
-		}
-		if gpgPassphraseRequired(stderr.String()) {
-			return "", fmt.Errorf("%w: %s", ErrPassphraseRequired, oneLine(stderr.String()))
-		}
-		return "", fmt.Errorf("pgp: send failed: %s", oneLine(stderr.String()))
-	}
-	return strings.TrimSpace(stdout.String()), nil
-}
-
-func gpgLoopbackArgs(args []string) []string {
-	out := []string{"--pinentry-mode", "loopback", "--passphrase-fd", "3"}
-	out = append(out, args...)
-	return out
-}
-
-func gpgPassphraseFD(passphrase []byte) (*os.File, func(), error) {
-	r, w, err := os.Pipe()
-	if err != nil {
-		return nil, func() {}, err
-	}
-	buf := append([]byte(nil), passphrase...)
-	buf = append(buf, '\n')
-	cleanup := func() {
-		clearBytes(buf)
-		_ = r.Close()
-	}
-	if _, err := w.Write(buf); err != nil {
-		_ = w.Close()
-		cleanup()
-		return nil, func() {}, err
-	}
-	if err := w.Close(); err != nil {
-		cleanup()
-		return nil, func() {}, err
-	}
-	return r, cleanup, nil
-}
-
-func clearBytes(data []byte) {
-	for i := range data {
-		data[i] = 0
-	}
-}
-
-func gpgPassphraseRequired(output string) bool {
-	lower := strings.ToLower(output)
-	return strings.Contains(lower, "need_passphrase") || strings.Contains(lower, "bad_passphrase") || strings.Contains(lower, "bad passphrase") || strings.Contains(lower, "no passphrase given") || strings.Contains(lower, "passphrase is required")
-}
-
-func signedMIMEEntity(entity, signature string) string {
-	boundary := mimeBoundary()
-	return strings.Join([]string{
-		"Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=" + boundary,
-		"",
-		"--" + boundary,
-		strings.TrimRight(canonicalCRLF(entity), "\r\n"),
-		"--" + boundary,
-		"Content-Type: application/pgp-signature; name=\"signature.asc\"",
-		"Content-Disposition: attachment; filename=\"signature.asc\"",
-		"Content-Transfer-Encoding: 7bit",
-		"",
-		strings.TrimSpace(signature),
-		"--" + boundary + "--",
-		"",
-	}, "\r\n")
-}
-
-func encryptedMIMEEntity(encrypted string) string {
-	boundary := mimeBoundary()
-	return strings.Join([]string{
-		"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=" + boundary,
-		"",
-		"--" + boundary,
-		"Content-Type: application/pgp-encrypted",
-		"",
-		"Version: 1",
-		"--" + boundary,
-		"Content-Type: application/octet-stream; name=\"encrypted.asc\"",
-		"Content-Disposition: inline; filename=\"encrypted.asc\"",
-		"Content-Transfer-Encoding: 7bit",
-		"",
-		strings.TrimSpace(encrypted),
-		"--" + boundary + "--",
-		"",
-	}, "\r\n")
-}
-
-func mimeBoundary() string {
-	var buf bytes.Buffer
-	return multipart.NewWriter(&buf).Boundary()
-}
-
-func canonicalCRLF(value string) string {
-	value = strings.ReplaceAll(value, "\r\n", "\n")
-	value = strings.ReplaceAll(value, "\r", "\n")
-	return strings.ReplaceAll(value, "\n", "\r\n")
 }
 
 func DraftNeedsSigning(draft protocol.Draft) bool {
 	options := ParseOptions(draft.PGP)
 	return options["sign"] || options["signed"]
 }
-
 func SigningNeedsPassphrase(identity string) (bool, error) {
-	identity = strings.TrimSpace(identity)
-	if identity == "" {
-		return false, fmt.Errorf("pgp: no signing identity")
-	}
 	if !HasSecretKey(identity) {
 		return false, fmt.Errorf("pgp: no secret key for %s", identity)
 	}
-	args := []string{"--batch", "--yes", "--armor", "--local-user", identity, "--detach-sign"}
-	_, err := runGPGWithOptions("murat signing probe\n", args, ApplyDraftOptions{LoopbackPinentry: true})
-	if err == nil {
-		return false, nil
-	}
-	if IsPassphraseRequired(err) {
-		return true, nil
-	}
-	return false, err
+	return false, nil
 }
+func IsPassphraseRequired(error) bool { return false }
 
 func CheckAvailability(from string, draft protocol.Draft) Availability {
-	hasSecret := HasSecretKey(from)
-	hasSenderPublicKey := HasPublicKey(from)
 	recipients := draftRecipients(draft)
 	encrypt := len(recipients) > 0 && len(MissingPublicKeys(recipients)) == 0
-	return Availability{
-		Sign:            hasSecret,
-		Encrypt:         encrypt,
-		SelfEncrypt:     hasSecret && hasSenderPublicKey && encrypt,
-		AttachPublicKey: hasSecret && hasSenderPublicKey,
-	}
+	secret := HasSecretKey(from)
+	return Availability{Sign: secret, Encrypt: encrypt, SelfEncrypt: secret && HasPublicKey(from) && encrypt, AttachPublicKey: secret && HasPublicKey(from)}
 }
-
 func HasSecretKey(identity string) bool {
-	return hasGPGRecord([]string{"sec", "ssb"}, "--list-secret-keys", identity)
+	ring, err := loadRing()
+	return err == nil && entityFor(ring, identity, true) != nil
 }
-
 func HasPublicKey(identity string) bool {
-	return hasGPGRecord([]string{"pub", "sub"}, "--list-keys", identity)
+	ring, err := loadRing()
+	return err == nil && entityFor(ring, identity, false) != nil
 }
-
 func MissingPublicKeys(recipients []string) []string {
 	missing := []string{}
 	seen := map[string]bool{}
 	for _, recipient := range recipients {
 		recipient = strings.TrimSpace(recipient)
-		if recipient == "" || seen[strings.ToLower(recipient)] {
-			continue
-		}
-		seen[strings.ToLower(recipient)] = true
-		if !HasPublicKey(recipient) {
-			missing = append(missing, recipient)
+		key := strings.ToLower(recipient)
+		if recipient != "" && !seen[key] {
+			seen[key] = true
+			if !HasPublicKey(recipient) {
+				missing = append(missing, recipient)
+			}
 		}
 	}
 	return missing
 }
 
-func ExportPublicKey(identity string) ([]byte, error) {
-	if !HasSecretKey(identity) {
-		return nil, fmt.Errorf("pgp: no secret key for %s", identity)
+func loadRing() (openpgp.EntityList, error) {
+	ringState.Lock()
+	defer ringState.Unlock()
+	if len(ringState.key) != 32 {
+		return nil, fmt.Errorf("pgp: local store is not open")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gpg", "--batch", "--yes", "--armor", "--export", identity)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("pgp: export timed out")
-		}
-		return nil, fmt.Errorf("pgp: export failed: %s", oneLine(stderr.String()))
-	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, fmt.Errorf("pgp: public key not found for %s", identity)
-	}
-	return out, nil
-}
-
-func hasGPGRecord(kinds []string, args ...string) bool {
-	if len(args) == 0 || strings.TrimSpace(args[len(args)-1]) == "" {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cmdArgs := append([]string{"--batch", "--with-colons"}, args...)
-	cmd := exec.CommandContext(ctx, "gpg", cmdArgs...)
-	out, err := cmd.Output()
-	if err != nil || ctx.Err() != nil {
-		return false
-	}
-	allowed := map[string]bool{}
-	for _, kind := range kinds {
-		allowed[kind] = true
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		kind, _, ok := strings.Cut(line, ":")
-		if ok && allowed[kind] {
-			return true
-		}
-	}
-	return false
-}
-
-func pgpStatus(stderr string, encrypted bool) string {
-	lower := strings.ToLower(stderr)
-	base := "pgp:"
-	if encrypted {
-		base = "pgp: decrypted"
-	}
-	if strings.Contains(lower, "good signature") || strings.Contains(lower, "[gnupg:] goodsig") || strings.Contains(lower, "[gnupg:] validsig") {
-		if encrypted {
-			return base + "; signature valid"
-		}
-		return base + " signature valid"
-	}
-	if strings.Contains(lower, "bad signature") || strings.Contains(lower, "[gnupg:] badsig") {
-		if encrypted {
-			return base + "; signature BAD"
-		}
-		return base + " signature BAD"
-	}
-	if strings.Contains(lower, "can't check signature") || strings.Contains(lower, "no public key") || strings.Contains(lower, "[gnupg:] no_pubkey") {
-		if encrypted {
-			return base + "; signature cannot be verified: No public key"
-		}
-		return base + " signature cannot be verified: No public key"
-	}
-	if encrypted {
-		return base
-	}
-	if message := oneLine(stderr); message != "" {
-		return fmt.Sprintf("pgp: %s", message)
-	}
-	return "pgp: signature processed"
-}
-
-func oneLine(text string) string {
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			return line
-		}
-	}
-	return ""
-}
-
-func pgpFailureStatus(action, stderr string, err error) string {
-	if status := pgpStatus(stderr, false); status != "" && status != "pgp: signature processed" {
-		return status
-	}
-	if message := oneLine(stderr); message != "" {
-		return "pgp: " + action + " failed: " + message
+	data, err := os.ReadFile(ringState.paths.PGPKeyFile)
+	if os.IsNotExist(err) {
+		return openpgp.EntityList{}, nil
 	}
 	if err != nil {
-		return "pgp: " + action + " failed: " + err.Error()
+		return nil, err
 	}
-	return "pgp: " + action + " failed"
+	box, err := crypto.NewBox(ringState.key)
+	if err != nil {
+		return nil, err
+	}
+	plain, err := box.Open(data)
+	if err != nil {
+		return nil, err
+	}
+	defer clearBytes(plain)
+	return openpgp.ReadKeyRing(bytes.NewReader(plain))
 }
-
-func isMissingPublicKeyStatus(status, stderr string) bool {
-	text := strings.ToLower(status + "\n" + stderr)
-	return strings.Contains(text, "no public key") || strings.Contains(text, "can't check signature") || strings.Contains(text, "cannot be verified")
+func saveRing(ring openpgp.EntityList) error {
+	ringState.Lock()
+	defer ringState.Unlock()
+	if len(ringState.key) != 32 {
+		return fmt.Errorf("pgp: local store is not open")
+	}
+	var raw bytes.Buffer
+	for _, entity := range ring {
+		if entity.PrivateKey != nil {
+			if err := entity.SerializePrivate(&raw, nil); err != nil {
+				return err
+			}
+		} else if err := entity.Serialize(&raw); err != nil {
+			return err
+		}
+	}
+	box, err := crypto.NewBox(ringState.key)
+	if err != nil {
+		return err
+	}
+	sealed, err := box.Seal(raw.Bytes())
+	if err != nil {
+		return err
+	}
+	if err := ringState.paths.EnsureDirs(); err != nil {
+		return err
+	}
+	return os.WriteFile(ringState.paths.PGPKeyFile, sealed, 0o600)
 }
-
+func readKeyRing(data []byte) (openpgp.EntityList, error) {
+	if strings.Contains(string(data), "-----BEGIN PGP") {
+		return openpgp.ReadArmoredKeyRing(bytes.NewReader(data))
+	}
+	return openpgp.ReadKeyRing(bytes.NewReader(data))
+}
+func armorPublic(ring openpgp.EntityList) ([]byte, error) {
+	var out bytes.Buffer
+	w, err := armor.Encode(&out, openpgp.PublicKeyType, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range ring {
+		if err := e.Serialize(w); err != nil {
+			return nil, err
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+func armorPrivate(ring openpgp.EntityList) ([]byte, error) {
+	var out bytes.Buffer
+	w, err := armor.Encode(&out, openpgp.PrivateKeyType, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range ring {
+		if e.PrivateKey != nil {
+			if err := e.SerializePrivate(w, nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+func entityFor(ring openpgp.EntityList, identity string, secret bool) *openpgp.Entity {
+	identity = strings.ToLower(strings.TrimSpace(identity))
+	for _, entity := range ring {
+		if secret && entity.PrivateKey == nil {
+			continue
+		}
+		for value := range entity.Identities {
+			address := identityAddress(value)
+			if strings.EqualFold(value, identity) || strings.EqualFold(address, identity) {
+				return entity
+			}
+		}
+	}
+	return nil
+}
+func identityAddress(value string) string {
+	if address, err := mail.ParseAddress(value); err == nil {
+		return strings.ToLower(address.Address)
+	}
+	return strings.ToLower(value)
+}
+func signerIf(ok bool, signer *openpgp.Entity) *openpgp.Entity {
+	if ok {
+		return signer
+	}
+	return nil
+}
+func armoredEncrypt(text string, recipients []*openpgp.Entity, signer *openpgp.Entity) (string, error) {
+	var out bytes.Buffer
+	armorWriter, err := armor.Encode(&out, "PGP MESSAGE", nil)
+	if err != nil {
+		return "", err
+	}
+	writer, err := openpgp.Encrypt(armorWriter, recipients, signer, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if _, err := writer.Write([]byte(text)); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	if err := armorWriter.Close(); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+func draftRecipients(d protocol.Draft) []string {
+	out := []string{}
+	for _, raw := range []string{d.To, d.Cc, d.Bcc} {
+		for _, a := range strings.Split(raw, ",") {
+			if parsed, err := mail.ParseAddress(strings.TrimSpace(a)); err == nil {
+				out = append(out, parsed.Address)
+			} else if strings.TrimSpace(a) != "" {
+				out = append(out, strings.TrimSpace(a))
+			}
+		}
+	}
+	return out
+}
 func ParseOptions(value string) map[string]bool {
 	out := map[string]bool{}
-	for _, item := range strings.FieldsFunc(strings.ToLower(value), func(r rune) bool {
-		return r == ',' || r == ';' || r == ' ' || r == '\t'
-	}) {
-		item = strings.TrimSpace(item)
-		if item != "" {
-			out[item] = true
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.ToLower(strings.TrimSpace(part)); part != "" {
+			out[part] = true
 		}
 	}
 	return out
 }
-
-var filenameClean = regexp.MustCompile(`[^A-Za-z0-9_.@-]+`)
-
+func canonicalCRLF(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	return strings.ReplaceAll(value, "\n", "\r\n")
+}
+func signedMIMEEntity(entity, signature string) string {
+	var buf bytes.Buffer
+	boundary := multipart.NewWriter(&buf).Boundary()
+	return strings.Join([]string{"Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=" + boundary, "", "--" + boundary, strings.TrimRight(canonicalCRLF(entity), "\r\n"), "--" + boundary, "Content-Type: application/pgp-signature; name=\"signature.asc\"", "Content-Disposition: attachment; filename=\"signature.asc\"", "Content-Transfer-Encoding: 7bit", "", strings.TrimSpace(signature), "--" + boundary + "--", ""}, "\r\n")
+}
+func encryptedMIMEEntity(encrypted string) string {
+	var buf bytes.Buffer
+	boundary := multipart.NewWriter(&buf).Boundary()
+	return strings.Join([]string{"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=" + boundary, "", "--" + boundary, "Content-Type: application/pgp-encrypted", "", "Version: 1", "--" + boundary, "Content-Type: application/octet-stream; name=\"encrypted.asc\"", "Content-Disposition: inline; filename=\"encrypted.asc\"", "Content-Transfer-Encoding: 7bit", "", strings.TrimSpace(encrypted), "--" + boundary + "--", ""}, "\r\n")
+}
 func publicKeyFilename(identity string) string {
-	identity = strings.ToLower(strings.TrimSpace(identity))
-	if parsed, err := mail.ParseAddress(identity); err == nil {
-		identity = strings.ToLower(parsed.Address)
+	value := strings.NewReplacer("@", "_at_", ".", "_").Replace(strings.TrimSpace(identity))
+	if value == "" {
+		value = "public-key"
 	}
-	identity = strings.Trim(filenameClean.ReplaceAllString(identity, "-"), "-.")
-	if identity == "" {
-		identity = "key"
-	}
-	return identity + ".asc"
+	return value + ".asc"
 }
-
-func draftRecipients(draft protocol.Draft) []string {
-	value := strings.Join([]string{draft.To, draft.Cc, draft.Bcc}, ",")
-	parsed, err := mail.ParseAddressList(value)
-	if err == nil {
-		out := make([]string, 0, len(parsed))
-		for _, address := range parsed {
-			out = append(out, address.Address)
-		}
-		return out
+func oneLine(value string) string { return strings.Join(strings.Fields(value), " ") }
+func clearBytes(data []byte) {
+	for i := range data {
+		data[i] = 0
 	}
-	out := []string{}
-	for _, item := range strings.Split(value, ",") {
-		item = strings.TrimSpace(item)
-		if item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
 }
+func now() time.Time { return time.Now() }

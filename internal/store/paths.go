@@ -13,6 +13,7 @@ type Paths struct {
 	IndexFile    string
 	AccountsFile string
 	SearchFile   string
+	PGPKeyFile   string
 	BodyDir      string
 	RawDir       string
 }
@@ -33,10 +34,11 @@ func DefaultPaths() Paths {
 		ConfigDir:    configDir,
 		ConfigFile:   filepath.Join(configDir, "config.toml"),
 		DataDir:      dataDir,
-		KeyFile:      filepath.Join(dataDir, "key.gpg"),
+		KeyFile:      filepath.Join(dataDir, "key.ssh.json"),
 		IndexFile:    filepath.Join(dataDir, "mail.enc.json"),
 		AccountsFile: filepath.Join(dataDir, "accounts.enc.json"),
 		SearchFile:   filepath.Join(dataDir, "search.enc.json"),
+		PGPKeyFile:   filepath.Join(dataDir, "pgp.enc"),
 		BodyDir:      filepath.Join(dataDir, "eml"),
 		RawDir:       filepath.Join(dataDir, "eml"),
 	}

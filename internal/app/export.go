@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"time"
 
 	"lehnert.dev/murat/internal/pgp"
@@ -21,7 +19,6 @@ type exportData struct {
 	KnownAddresses []store.KnownAddress
 	PublicKeys     []byte
 	SecretKeys     []byte
-	OwnerTrust     []byte
 }
 
 type exportManifest struct {
@@ -32,14 +29,13 @@ type exportManifest struct {
 	KnownAddresses      int      `json:"known_addresses"`
 	PublicKeyBytes      int      `json:"public_key_bytes"`
 	SecretKeyBytes      int      `json:"secret_key_bytes"`
-	OwnerTrustBytes     int      `json:"ownertrust_bytes"`
 	SymmetricEncryption string   `json:"symmetric_encryption"`
 	Files               []string `json:"files"`
 }
 
 var (
 	collectExportData         = defaultCollectExportData
-	encryptExportData         = gpgSymmetricEncryptExport
+	encryptExportData         = nativeEncryptExport
 	promptBackupPassphrase    = readBackupPassphrase
 	promptNewBackupPassphrase = readNewBackupPassphrase
 )
@@ -75,7 +71,7 @@ func cmdExport(args []string) error {
 }
 
 func usageExport(fs *flag.FlagSet) {
-	usageFlags("export [flags] OUTPUT", "export accounts, known addresses, and GPG keys to a symmetric GPG-encrypted tar archive", fs)
+	usageFlags("export [flags] OUTPUT", "export accounts, known addresses, and managed PGP keys to an encrypted archive", fs)
 }
 
 func ensureExportOutputMissing(path string) error {
@@ -91,7 +87,7 @@ func ensureExportOutputMissing(path string) error {
 
 func defaultCollectExportData() (exportData, error) {
 	paths := store.DefaultPaths()
-	key, err := store.LoadKey(paths)
+	key, err := loadLocalStoreKey(paths)
 	if err != nil {
 		return exportData{}, fmt.Errorf("not initialized: %w", err)
 	}
@@ -122,114 +118,12 @@ func defaultCollectExportData() (exportData, error) {
 	if err != nil {
 		return exportData{}, err
 	}
-	ownerTrust, err := pgp.ExportOwnerTrust()
-	if err != nil {
-		return exportData{}, err
-	}
 	return exportData{
 		Accounts:       accounts,
 		KnownAddresses: known,
 		PublicKeys:     publicKeys,
 		SecretKeys:     secretKeys,
-		OwnerTrust:     ownerTrust,
 	}, nil
-}
-
-func gpgSymmetricEncryptExport(output string, force bool, data exportData) error {
-	passphrase, err := promptNewBackupPassphrase()
-	if err != nil {
-		return err
-	}
-	defer clearBytes(passphrase)
-
-	dir := filepath.Dir(output)
-	base := filepath.Base(output)
-	tmp, err := os.CreateTemp(dir, "."+base+".*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	defer os.Remove(tmpPath)
-
-	passphraseFile, cleanupPassphrase, err := passphraseFD(passphrase)
-	if err != nil {
-		return err
-	}
-	defer cleanupPassphrase()
-
-	cmd := exec.Command("gpg", gpgSymmetricEncryptArgs(tmpPath)...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.ExtraFiles = []*os.File{passphraseFile}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	writeErr := writeExportTar(stdin, data)
-	closeErr := stdin.Close()
-	waitErr := cmd.Wait()
-	if writeErr != nil {
-		return writeErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if waitErr != nil {
-		return fmt.Errorf("gpg symmetric encrypt failed: %w", waitErr)
-	}
-	if err := os.Chmod(tmpPath, 0o600); err != nil {
-		return err
-	}
-	return installEncryptedExport(tmpPath, output, force)
-}
-
-func gpgSymmetricEncryptArgs(output string) []string {
-	return []string{"--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "3", "--symmetric", "--cipher-algo", "AES256", "--output", output}
-}
-
-func installEncryptedExport(tmpPath, output string, force bool) error {
-	in, err := os.Open(tmpPath)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	flags := os.O_WRONLY | os.O_CREATE
-	if force {
-		flags |= os.O_TRUNC
-	} else {
-		flags |= os.O_EXCL
-	}
-	out, err := os.OpenFile(output, flags, 0o600)
-	if err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("output exists: %s (use --force to overwrite)", output)
-		}
-		return err
-	}
-	copied := false
-	defer func() {
-		_ = out.Close()
-		if !copied {
-			_ = os.Remove(output)
-		}
-	}()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	if err := out.Chmod(0o600); err != nil {
-		return err
-	}
-	copied = true
-	return nil
 }
 
 func writeExportTar(w io.Writer, data exportData) error {
@@ -241,20 +135,18 @@ func writeExportTarAt(w io.Writer, data exportData, now time.Time) error {
 		"manifest.json",
 		"accounts.json",
 		"known-addresses.json",
-		"gpg/public.asc",
-		"gpg/secret.asc",
-		"gpg/ownertrust.txt",
+		"pgp/public.asc",
+		"pgp/secret.asc",
 	}
 	manifest := exportManifest{
-		Version:             1,
+		Version:             2,
 		CreatedAt:           now.Format(time.RFC3339),
 		MuratVersion:        commit,
 		Accounts:            len(data.Accounts),
 		KnownAddresses:      len(data.KnownAddresses),
 		PublicKeyBytes:      len(data.PublicKeys),
 		SecretKeyBytes:      len(data.SecretKeys),
-		OwnerTrustBytes:     len(data.OwnerTrust),
-		SymmetricEncryption: "gpg --symmetric --cipher-algo AES256",
+		SymmetricEncryption: "argon2id + aes-256-gcm",
 		Files:               files,
 	}
 	tw := tar.NewWriter(w)
@@ -267,13 +159,10 @@ func writeExportTarAt(w io.Writer, data exportData, now time.Time) error {
 	if err := writeJSONTarFile(tw, "known-addresses.json", data.KnownAddresses, now); err != nil {
 		return err
 	}
-	if err := writeTarFile(tw, "gpg/public.asc", data.PublicKeys, 0o600, now); err != nil {
+	if err := writeTarFile(tw, "pgp/public.asc", data.PublicKeys, 0o600, now); err != nil {
 		return err
 	}
-	if err := writeTarFile(tw, "gpg/secret.asc", data.SecretKeys, 0o600, now); err != nil {
-		return err
-	}
-	if err := writeTarFile(tw, "gpg/ownertrust.txt", data.OwnerTrust, 0o600, now); err != nil {
+	if err := writeTarFile(tw, "pgp/secret.asc", data.SecretKeys, 0o600, now); err != nil {
 		return err
 	}
 	return tw.Close()
