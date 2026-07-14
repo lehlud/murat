@@ -2311,10 +2311,12 @@ const (
 	inlineImageMaxCount        = 8
 	inlineImageMaxBytes        = 10 << 20
 	inlineImageMaxTotalBytes   = 20 << 20
-	inlineImageMaxDimension    = 4096
-	inlineImageMaxPixels       = 16 << 20
+	inlineImageMaxDimension    = 6144
+	inlineImageMaxPixels       = 32 << 20
 	inlineImageMaxColumns      = 48
 	inlineImageMaxTerminalRows = 24
+	inlineImageMinColumns      = 4
+	inlineImageMinTerminalRows = 4
 )
 
 type previewPart struct {
@@ -2637,7 +2639,8 @@ func (value *previewImage) rasterRows(width int) [][]pixelCell {
 	sourceWidth, sourceHeight := bounds.Dx(), bounds.Dy()
 	targetWidth, targetHeight := sourceWidth, sourceHeight
 	maxWidth := max(1, min(width, inlineImageMaxColumns))
-	maxWidth = max(1, min(maxWidth, sourceWidth/8))
+	minWidth := min(inlineImageMinColumns, maxWidth)
+	maxWidth = max(minWidth, min(maxWidth, sourceWidth/8))
 	maxPixelHeight := inlineImageMaxTerminalRows * 2
 	if targetWidth > maxWidth {
 		targetHeight = max(1, targetHeight*maxWidth/targetWidth)
@@ -2647,6 +2650,10 @@ func (value *previewImage) rasterRows(width int) [][]pixelCell {
 		targetWidth = max(1, targetWidth*maxPixelHeight/targetHeight)
 		targetHeight = maxPixelHeight
 	}
+	// A pixel-art thumbnail needs a usable footprint. This deliberately wins
+	// over the source-pixels/8 cap used to avoid oversized tiny images.
+	targetWidth = max(minWidth, targetWidth)
+	targetHeight = max(inlineImageMinTerminalRows*2, targetHeight)
 	rows := make([][]pixelCell, (targetHeight+1)/2)
 	for row := range rows {
 		rows[row] = make([]pixelCell, targetWidth)

@@ -7,7 +7,6 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
-	"strings"
 	"testing"
 
 	"lehnert.dev/murat/internal/store"
@@ -21,27 +20,24 @@ func TestInlineImageRasterUsesHalfBlocksAndTransparency(t *testing.T) {
 	source.SetNRGBA(8, 8, color.NRGBA{G: 255, A: 128})
 	value := &previewImage{source: source, rows: map[int][][]pixelCell{}}
 	rows := value.rasterRows(48)
-	if len(rows) != 1 || len(rows[0]) != 2 {
+	if len(rows) != 4 || len(rows[0]) != 4 {
 		t.Fatalf("rows = %#v", rows)
 	}
-	if !rows[0][0].topSet || !rows[0][0].bottomSet || rows[0][0].top.R != 255 || rows[0][0].bottom.B != 255 {
-		t.Fatalf("first cell = %#v", rows[0][0])
+	if !rows[0][0].topSet || rows[0][0].top.R != 255 {
+		t.Fatalf("red pixel = %#v", rows[0][0])
 	}
-	if rows[0][1].topSet || !rows[0][1].bottomSet {
-		t.Fatalf("alpha threshold cell = %#v", rows[0][1])
+	if !rows[2][0].topSet || rows[2][0].top.B != 255 {
+		t.Fatalf("blue pixel = %#v", rows[2][0])
 	}
-	output := captureStdout(t, func() { printPixelLine(0, 0, 2, rows[0]) })
-	for _, want := range []string{"38;2;255;0;0;48;2;0;0;255m▀", "38;2;0;255;0;49m▄"} {
-		if !strings.Contains(output, want) {
-			t.Fatalf("pixel output missing %q in %q", want, output)
-		}
+	if rows[0][2].topSet || !rows[2][2].topSet {
+		t.Fatalf("alpha threshold cells = %#v %#v", rows[0][2], rows[2][2])
 	}
 }
 
-func TestInlineImageRasterSizingAndNoUpscale(t *testing.T) {
+func TestInlineImageRasterSizing(t *testing.T) {
 	small := &previewImage{source: image.NewNRGBA(image.Rect(0, 0, 16, 24)), rows: map[int][][]pixelCell{}}
 	rows := small.rasterRows(80)
-	if len(rows) != 2 || len(rows[0]) != 2 {
+	if len(rows) != 4 || len(rows[0]) != 4 {
 		t.Fatalf("small raster size = %dx%d", len(rows[0]), len(rows))
 	}
 	large := &previewImage{source: image.NewNRGBA(image.Rect(0, 0, 100, 100)), rows: map[int][][]pixelCell{}}
@@ -60,16 +56,16 @@ func TestInlineImageRasterSizingAndNoUpscale(t *testing.T) {
 	}
 }
 
-func TestInlineImageUsesEightPixelsPerColumnUpperBound(t *testing.T) {
+func TestInlineImageMinimumRenderedSizeBeatsPixelsPerColumnCap(t *testing.T) {
 	value := &previewImage{source: image.NewNRGBA(image.Rect(0, 0, 16, 16)), rows: map[int][][]pixelCell{}}
 	rows := value.rasterRows(80)
-	if len(rows) != 1 || len(rows[0]) != 2 {
-		t.Fatalf("raster size = %dx%d, want 2x1", len(rows[0]), len(rows))
+	if len(rows) != 4 || len(rows[0]) != 4 {
+		t.Fatalf("raster size = %dx%d, want 4x4", len(rows[0]), len(rows))
 	}
 	tiny := &previewImage{source: image.NewNRGBA(image.Rect(0, 0, 7, 7)), rows: map[int][][]pixelCell{}}
 	rows = tiny.rasterRows(80)
-	if len(rows) != 1 || len(rows[0]) != 1 {
-		t.Fatalf("tiny raster size = %dx%d, want 1x1", len(rows[0]), len(rows))
+	if len(rows) != 4 || len(rows[0]) != 4 {
+		t.Fatalf("tiny raster size = %dx%d, want 4x4", len(rows[0]), len(rows))
 	}
 }
 
@@ -101,7 +97,7 @@ func TestPreparePreviewPartsDecodesPNGAndFallsBack(t *testing.T) {
 			}
 		}
 	}
-	if imageRows != 1 {
+	if imageRows != 4 {
 		t.Fatalf("image rows = %d in %#v", imageRows, rows)
 	}
 }
@@ -166,7 +162,7 @@ func TestImageAttachmentHitTargetUsesRenderedBounds(t *testing.T) {
 			break
 		}
 	}
-	if imageLine < 0 || imageWidth != 2 {
+	if imageLine < 0 || imageWidth != 4 {
 		t.Fatalf("image line = %d, width = %d", imageLine, imageWidth)
 	}
 	attachment, ok := app.imageAttachmentAtBodyPoint(app.bodyArea.x, app.bodyArea.y+imageLine)

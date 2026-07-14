@@ -241,7 +241,9 @@ func completionContext(line string, character int) (int, string, bool) {
 		return 0, "", false
 	}
 	field := strings.ToLower(strings.TrimSpace(line[:colon]))
-	if field != "to" && field != "cc" && field != "bcc" {
+	switch field {
+	case "from", "to", "cc", "bcc":
+	default:
 		return 0, "", false
 	}
 	pos := byteIndexForCharacter(line, character)

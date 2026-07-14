@@ -203,6 +203,7 @@ Opening mail detects inline PGP messages/signatures and decrypts or verifies the
 
 `murat lsp` starts a small stdio language server that completes known identities in compose draft headers:
 
+- `From:`
 - `To:`
 - `Cc:`
 - `Bcc:`
